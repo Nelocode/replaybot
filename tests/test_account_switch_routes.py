@@ -57,13 +57,23 @@ class AccountSwitchRoutesTestCase(unittest.TestCase):
         return credentials
 
     def test_channel_mutations_require_admin_browser_and_valid_csrf(self):
-        with patch.object(app_module, "restart_wa_bot") as restart:
+        with (
+            patch.object(app_module, "restart_wa_bot") as restart,
+            patch.object(app_module, "_start_wa_process") as start_switch,
+        ):
             anonymous = self.client.post(
                 "/api/restart_wa_bot",
                 headers=self.mutation_headers(),
             )
             self.assertEqual(403, anonymous.status_code)
             self.assertEqual("admin_required", anonymous.get_json()["error_code"])
+            anonymous_switch = self.client.post(
+                "/api/switch_wa",
+                json={"confirm": True},
+                headers=self.mutation_headers(),
+            )
+            self.assertEqual(403, anonymous_switch.status_code)
+            self.assertEqual("admin_required", anonymous_switch.get_json()["error_code"])
 
             self.authorize_browser()
             missing_csrf = self.client.post("/api/restart_wa_bot")
@@ -77,6 +87,8 @@ class AccountSwitchRoutesTestCase(unittest.TestCase):
         self.assertEqual(403, invalid_csrf.status_code)
         self.assertEqual("csrf_invalid", invalid_csrf.get_json()["error_code"])
         restart.assert_not_called()
+        start_switch.assert_not_called()
+        self.assertFalse(self.wa_switch_dir.exists())
 
     def test_restart_whatsapp_preserves_active_auth_directory(self):
         credentials = self.seed_active_whatsapp()
@@ -97,6 +109,50 @@ class AccountSwitchRoutesTestCase(unittest.TestCase):
         stop.assert_called_once_with(self.data_dir / "wa_bot.pid")
         self.assertEqual(self.wa_auth_dir, start.call_args.kwargs["auth_dir"])
         self.assertFalse(start.call_args.kwargs["link_only"])
+
+    def test_restart_rejects_a_session_that_requires_a_new_qr(self):
+        credentials = self.seed_active_whatsapp()
+        self.authorize_browser()
+
+        with (
+            patch.object(
+                app_module,
+                "_read_wa_call_health",
+                return_value={"reauth_required": True, "disconnect_reason": "logged_out"},
+            ),
+            patch.object(app_module, "restart_wa_bot") as restart,
+        ):
+            response = self.client.post(
+                "/api/restart_wa_bot",
+                headers=self.mutation_headers(),
+            )
+
+        self.assertEqual(409, response.status_code)
+        self.assertEqual("reauth_required", response.get_json()["error_code"])
+        self.assertIn("Volver a vincular", response.get_json()["error"])
+        restart.assert_not_called()
+        self.assertEqual("old-account-session", credentials.read_text(encoding="utf-8"))
+
+    def test_open_connection_wins_over_stale_logout_health_when_restarting(self):
+        self.seed_active_whatsapp()
+        self.authorize_browser()
+        stale_health = {
+            "connection": "open",
+            "reauth_required": True,
+            "disconnect_reason": "logged_out",
+        }
+        with (
+            patch.object(app_module, "_read_wa_call_health", return_value=stale_health),
+            patch.object(app_module, "_wa_process_running", return_value=True),
+            patch.object(app_module, "restart_wa_bot", return_value=9753) as restart,
+        ):
+            response = self.client.post(
+                "/api/restart_wa_bot",
+                headers=self.mutation_headers(),
+            )
+
+        self.assertEqual(200, response.status_code)
+        restart.assert_called_once_with()
 
     def test_whatsapp_status_requires_an_open_socket_not_only_a_live_pid(self):
         self.seed_active_whatsapp()
@@ -186,10 +242,45 @@ class AccountSwitchRoutesTestCase(unittest.TestCase):
                 json={"confirm": False},
                 headers=self.mutation_headers(),
             )
+            invalid_payload = self.client.post(
+                "/api/switch_wa",
+                json=[],
+                headers=self.mutation_headers(),
+            )
 
         self.assertEqual(400, response.status_code)
         self.assertFalse(response.get_json()["ok"])
+        self.assertEqual(400, invalid_payload.status_code)
         start.assert_not_called()
+
+    def test_claim_requires_admin_csrf_and_explicit_confirmation(self):
+        anonymous = self.client.post(
+            "/api/switch_wa/claim",
+            json={"confirm": True},
+            headers=self.mutation_headers(),
+        )
+        self.assertEqual(403, anonymous.status_code)
+        self.assertEqual("admin_required", anonymous.get_json()["error_code"])
+
+        self.authorize_browser()
+        missing_csrf = self.client.post(
+            "/api/switch_wa/claim",
+            json={"confirm": True},
+        )
+        not_confirmed = self.client.post(
+            "/api/switch_wa/claim",
+            json={"confirm": False},
+            headers=self.mutation_headers(),
+        )
+        invalid_payload = self.client.post(
+            "/api/switch_wa/claim",
+            json=[],
+            headers=self.mutation_headers(),
+        )
+        self.assertEqual(403, missing_csrf.status_code)
+        self.assertEqual("csrf_invalid", missing_csrf.get_json()["error_code"])
+        self.assertEqual(400, not_confirmed.status_code)
+        self.assertEqual(400, invalid_payload.status_code)
 
     def test_pending_recovery_blocks_another_whatsapp_switch(self):
         self.seed_active_whatsapp()
@@ -210,6 +301,288 @@ class AccountSwitchRoutesTestCase(unittest.TestCase):
         start.assert_not_called()
         self.assertEqual("backup", (recovery / "creds.json").read_text(encoding="utf-8"))
         self.assertFalse(self.wa_switch_dir.exists())
+
+    def test_logged_out_state_is_visible_and_points_to_reauthentication(self):
+        self.seed_active_whatsapp()
+        with (
+            patch.object(app_module, "_telegram_session_is_authorized", return_value=True),
+            patch.object(app_module, "bot_is_running", return_value=True),
+            patch.object(app_module, "_wa_process_running", return_value=False),
+            patch.object(app_module, "_wa_connection_open", return_value=False),
+            patch.object(
+                app_module,
+                "_read_wa_call_health",
+                return_value={"reauth_required": True, "disconnect_reason": "logged_out"},
+            ),
+            patch.object(app_module, "_load_wa_switch_operation", return_value=None),
+        ):
+            anonymous = self.client.get("/api/channels")
+            self.authorize_browser()
+            administrator = self.client.get("/api/channels")
+
+        for response in (anonymous, administrator):
+            self.assertEqual(200, response.status_code)
+            self.assertEqual("no-store, private", response.headers["Cache-Control"])
+            whatsapp = response.get_json()["whatsapp"]
+            self.assertTrue(whatsapp["linked"])
+            self.assertFalse(whatsapp["ready"])
+            self.assertFalse(whatsapp["worker_running"])
+            self.assertTrue(whatsapp["reauth_required"])
+            self.assertEqual("reauth_required", whatsapp["state"])
+
+    def test_stale_logout_health_does_not_hide_an_unlinked_account(self):
+        with (
+            patch.object(app_module, "_telegram_session_is_authorized", return_value=True),
+            patch.object(app_module, "bot_is_running", return_value=True),
+            patch.object(app_module, "_wa_process_running", return_value=False),
+            patch.object(app_module, "_wa_connection_open", return_value=False),
+            patch.object(
+                app_module,
+                "_read_wa_call_health",
+                return_value={"reauth_required": True, "disconnect_reason": "logged_out"},
+            ),
+            patch.object(app_module, "_load_wa_switch_operation", return_value=None),
+        ):
+            response = self.client.get("/api/channels")
+
+        whatsapp = response.get_json()["whatsapp"]
+        self.assertFalse(whatsapp["linked"])
+        self.assertFalse(whatsapp["reauth_required"])
+        self.assertEqual("unlinked", whatsapp["state"])
+
+    def test_open_connection_wins_over_stale_logout_health_in_channel_state(self):
+        self.seed_active_whatsapp()
+        self.authorize_browser()
+        with (
+            patch.object(app_module, "_telegram_session_is_authorized", return_value=True),
+            patch.object(app_module, "bot_is_running", return_value=True),
+            patch.object(app_module, "_wa_process_running", return_value=True),
+            patch.object(app_module, "_wa_connection_open", return_value=True),
+            patch.object(
+                app_module,
+                "_read_wa_call_health",
+                return_value={"reauth_required": True, "disconnect_reason": "logged_out"},
+            ),
+            patch.object(app_module, "_load_wa_switch_operation", return_value=None),
+        ):
+            response = self.client.get("/api/channels")
+
+        whatsapp = response.get_json()["whatsapp"]
+        self.assertTrue(whatsapp["ready"])
+        self.assertFalse(whatsapp["reauth_required"])
+        self.assertEqual("ready", whatsapp["state"])
+
+    def test_foreign_active_switch_is_not_mistaken_for_an_owned_qr(self):
+        credentials = self.seed_active_whatsapp()
+        self.authorize_browser()
+        self.wa_switch_dir.mkdir(parents=True)
+        app_module._save_wa_switch_operation({
+            "version": 1,
+            "token_hash": app_module._wa_switch_token_digest("another-browser"),
+            "started_at": time.time(),
+            "status": "preparing",
+        })
+        app_module.WA_SWITCH_QR_FILE.write_bytes(b"foreign-qr")
+
+        with (
+            patch.object(app_module, "_wa_process_running", return_value=True),
+            patch.object(app_module, "_wa_connection_open", return_value=False),
+            patch.object(app_module, "_start_wa_process") as start,
+        ):
+            response = self.client.post(
+                "/api/switch_wa",
+                json={"confirm": True},
+                headers=self.mutation_headers(),
+            )
+            channels = self.client.get("/api/channels")
+            qr = self.client.get("/api/switch_wa/qr")
+
+        self.assertEqual(409, response.status_code)
+        payload = response.get_json()
+        self.assertEqual("switch_in_progress", payload["error_code"])
+        self.assertFalse(payload["owned_by_this_browser"])
+        self.assertGreater(payload["retry_after"], 0)
+        self.assertEqual("switching_elsewhere", channels.get_json()["whatsapp"]["state"])
+        self.assertEqual(404, qr.status_code)
+        start.assert_not_called()
+        self.assertEqual("old-account-session", credentials.read_text(encoding="utf-8"))
+
+    def test_owned_active_switch_can_resume_polling(self):
+        self.authorize_browser()
+        token = "current-browser"
+        self.wa_switch_dir.mkdir(parents=True)
+        app_module._save_wa_switch_operation({
+            "version": 1,
+            "token_hash": app_module._wa_switch_token_digest(token),
+            "started_at": time.time(),
+            "status": "preparing",
+        })
+        with self.client.session_transaction() as browser_session:
+            browser_session["wa_switch_token"] = token
+
+        with (
+            patch.object(app_module, "_wa_process_running", return_value=True),
+            patch.object(app_module, "_start_wa_process") as start,
+        ):
+            response = self.client.post(
+                "/api/switch_wa",
+                json={"confirm": True},
+                headers=self.mutation_headers(),
+            )
+
+        self.assertEqual(409, response.status_code)
+        self.assertTrue(response.get_json()["owned_by_this_browser"])
+        self.assertEqual("switching", response.get_json()["state"])
+        start.assert_not_called()
+
+    def test_dead_foreign_switch_is_replaced_without_waiting_for_ttl(self):
+        credentials = self.seed_active_whatsapp()
+        self.authorize_browser()
+        self.wa_switch_dir.mkdir(parents=True)
+        app_module.WA_SWITCH_AUTH_DIR.mkdir()
+        (app_module.WA_SWITCH_AUTH_DIR / "creds.json").write_text("dead-candidate", encoding="utf-8")
+        app_module.WA_SWITCH_QR_FILE.write_bytes(b"stale-qr")
+        app_module._save_wa_switch_operation({
+            "version": 1,
+            "token_hash": app_module._wa_switch_token_digest("dead-browser"),
+            "started_at": time.time(),
+            "status": "preparing",
+        })
+
+        with (
+            patch.object(app_module, "_wa_process_running", return_value=False),
+            patch.object(app_module, "_start_wa_process", return_value=2468) as start,
+            patch.object(app_module, "_schedule_wa_switch_expiry"),
+        ):
+            response = self.client.post(
+                "/api/switch_wa",
+                json={"confirm": True},
+                headers=self.mutation_headers(),
+            )
+
+        self.assertEqual(202, response.status_code)
+        self.assertFalse(app_module.WA_SWITCH_QR_FILE.exists())
+        self.assertEqual("old-account-session", credentials.read_text(encoding="utf-8"))
+        start.assert_called_once()
+        self.assertTrue(start.call_args.kwargs["link_only"])
+        operation = app_module._load_wa_switch_operation()
+        with self.client.session_transaction() as browser_session:
+            token = browser_session["wa_switch_token"]
+        self.assertEqual(app_module._wa_switch_token_digest(token), operation["token_hash"])
+
+    def test_live_foreign_switch_expires_then_allows_a_clean_retry(self):
+        credentials = self.seed_active_whatsapp()
+        self.authorize_browser()
+        self.wa_switch_dir.mkdir(parents=True)
+        app_module.WA_SWITCH_QR_FILE.write_bytes(b"old-qr")
+        app_module._save_wa_switch_operation({
+            "version": 1,
+            "token_hash": app_module._wa_switch_token_digest("foreign-browser"),
+            "started_at": time.time(),
+            "status": "preparing",
+        })
+
+        with (
+            patch.object(app_module, "_wa_process_running", return_value=True),
+            patch.object(app_module, "_start_wa_process") as start,
+        ):
+            blocked = self.client.post(
+                "/api/switch_wa",
+                json={"confirm": True},
+                headers=self.mutation_headers(),
+            )
+        self.assertEqual(409, blocked.status_code)
+        start.assert_not_called()
+
+        with (
+            patch.object(app_module, "WA_SWITCH_TIMEOUT_SECONDS", 0),
+            patch.object(app_module, "_wa_process_running", return_value=True),
+            patch.object(app_module, "_start_wa_process", return_value=8642) as restart,
+            patch.object(app_module, "_schedule_wa_switch_expiry"),
+        ):
+            retried = self.client.post(
+                "/api/switch_wa",
+                json={"confirm": True},
+                headers=self.mutation_headers(),
+            )
+
+        self.assertEqual(202, retried.status_code)
+        restart.assert_called_once()
+        self.assertFalse(app_module.WA_SWITCH_QR_FILE.exists())
+        self.assertEqual("old-account-session", credentials.read_text(encoding="utf-8"))
+        with self.client.session_transaction() as browser_session:
+            current_token = browser_session["wa_switch_token"]
+        self.assertEqual(
+            app_module._wa_switch_token_digest(current_token),
+            app_module._load_wa_switch_operation()["token_hash"],
+        )
+
+    def test_claim_keeps_the_original_deadline(self):
+        operation = {
+            "version": 1,
+            "token_hash": app_module._wa_switch_token_digest("claimed"),
+            "started_at": 1_000.0,
+            "status": "preparing",
+        }
+        app_module._cancel_wa_switch_expiry()
+        with (
+            patch.object(app_module.time, "time", return_value=1_120.0),
+            patch.object(app_module.threading, "Timer") as timer_factory,
+        ):
+            app_module._schedule_wa_switch_expiry(operation)
+
+        delay = timer_factory.call_args.args[0]
+        self.assertAlmostEqual(60.0, delay, places=2)
+        timer_factory.return_value.start.assert_called_once_with()
+        app_module._cancel_wa_switch_expiry()
+
+    def test_admin_can_claim_a_foreign_qr_without_touching_active_auth(self):
+        credentials = self.seed_active_whatsapp()
+        self.authorize_browser()
+        previous_token = "previous-browser"
+        previous_client = app_module.app.test_client()
+        with previous_client.session_transaction() as browser_session:
+            browser_session["wa_admin"] = True
+            browser_session["channel_csrf"] = self.CSRF
+            browser_session["wa_switch_token"] = previous_token
+
+        self.wa_switch_dir.mkdir(parents=True)
+        app_module.WA_SWITCH_QR_FILE.write_bytes(b"candidate-qr")
+        original_started_at = time.time()
+        app_module._save_wa_switch_operation({
+            "version": 1,
+            "token_hash": app_module._wa_switch_token_digest(previous_token),
+            "started_at": original_started_at,
+            "status": "preparing",
+        })
+
+        with (
+            patch.object(app_module, "_wa_process_running", return_value=True),
+            patch.object(app_module, "_wa_connection_open", return_value=False),
+            patch.object(app_module, "_schedule_wa_switch_expiry") as schedule,
+        ):
+            claimed = self.client.post(
+                "/api/switch_wa/claim",
+                json={"confirm": True},
+                headers=self.mutation_headers(),
+            )
+            current_qr = self.client.get("/api/switch_wa/qr")
+            previous_status = previous_client.get("/api/switch_wa/status")
+
+        self.assertEqual(200, claimed.status_code)
+        self.assertTrue(claimed.get_json()["ok"])
+        self.assertTrue(claimed.get_json()["qr_ready"])
+        self.assertEqual(200, current_qr.status_code)
+        current_qr.close()
+        self.assertEqual(404, previous_status.status_code)
+        self.assertEqual("old-account-session", credentials.read_text(encoding="utf-8"))
+        operation = app_module._load_wa_switch_operation()
+        with self.client.session_transaction() as browser_session:
+            current_token = browser_session["wa_switch_token"]
+        self.assertEqual(app_module._wa_switch_token_digest(current_token), operation["token_hash"])
+        self.assertNotEqual(app_module._wa_switch_token_digest(previous_token), operation["token_hash"])
+        self.assertEqual(original_started_at, operation["started_at"])
+        schedule.assert_called_once()
 
     def test_status_is_read_only_and_commit_promotes_once(self):
         self.seed_active_whatsapp()

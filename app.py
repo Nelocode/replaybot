@@ -145,7 +145,7 @@ label { color: #c8c8e0 !important; font-weight: 500; }
       </div>
       <button class="btn btn-sm btn-outline-light" onclick="showSetup()">⚙️ Configurar</button>
       <button class="btn btn-sm btn-outline-light" onclick="restartBot()">🔄 Reiniciar servicio TG</button>
-      <button class="btn btn-sm btn-outline-light" onclick="restartWaBot()">🔄 Reiniciar servicio WA</button>
+      <button id="restart-wa-btn" class="btn btn-sm btn-outline-light" onclick="restartWaBot()">🔄 Reiniciar servicio WA</button>
     </div>
   </div>
 
@@ -332,6 +332,7 @@ let waSwitchPolling = false;
 let waCommitInFlight = false;
 let waSwitchGeneration = 0;
 let waSwitchPollAbortController = null;
+let channelStateRequest = null;
 
 function toast(msg, type="success") {
   const c = document.getElementById("toast-container");
@@ -344,7 +345,7 @@ function toast(msg, type="success") {
 
 async function loadData() {
   try {
-    const r = await fetch("/api/data");
+    const r = await fetch("/api/data", {cache: "no-store"});
     const data = await r.json();
     renderSteps(data);
     updateBotStatus(data.bot_running);
@@ -623,6 +624,20 @@ async function restartBot() {
 }
 
 async function restartWaBot() {
+  const latest = await loadChannelState();
+  if (!latest) {
+    toast("❌ No fue posible consultar el estado de WhatsApp", "error");
+    return;
+  }
+  if (!latest.can_manage) {
+    guideChannelAdminRecovery();
+    return;
+  }
+  if (latest.whatsapp && latest.whatsapp.reauth_required) {
+    toast("⚠️ WhatsApp cerró la sesión; necesitas un QR nuevo", "error");
+    await startWaSwitch(latest);
+    return;
+  }
   if (!confirm("¿Reiniciar el servicio de WhatsApp? La cuenta vinculada se conservará.")) return;
   toast("🔄 Reiniciando servicio WA...", "success");
   try {
@@ -720,6 +735,27 @@ function safeAccountLabel(account, fallback) {
   return parts.length ? parts.join(" · ") : fallback;
 }
 
+function guideChannelAdminRecovery() {
+  document.getElementById("setup-modal").style.display = "block";
+  const status = document.getElementById("tg-link-status");
+  status.innerHTML = "🔐 Confirma el <strong>api_id, api_hash y teléfono actuales de Telegram</strong> para recuperar el acceso administrativo en este navegador.";
+  const form = document.getElementById("tg-initial-link");
+  form.style.display = "block";
+  requestAnimationFrame(() => {
+    form.scrollIntoView({behavior: "smooth", block: "center"});
+    document.getElementById("tg-api-id").focus();
+  });
+  toast("🔐 Recupera primero el acceso del panel con la cuenta actual de Telegram", "error");
+}
+
+function revealWaQrCard(resetImage=false) {
+  const card = document.getElementById("wa-qr-card");
+  const image = document.getElementById("wa-qr-img");
+  card.style.display = "block";
+  if (resetImage) image.removeAttribute("src");
+  requestAnimationFrame(() => card.scrollIntoView({behavior: "smooth", block: "start"}));
+}
+
 function renderChannelState(data) {
   channelState = data;
   channelCsrf = data.csrf || channelCsrf;
@@ -751,9 +787,20 @@ function renderChannelState(data) {
   const wa = data.whatsapp || {};
   const waBtn = document.getElementById("wa-switch-btn");
   const waSummary = document.getElementById("wa-account-summary");
-  waBtn.disabled = !data.can_manage || wa.state === "recovery_required" || wa.state === "switching";
-  waBtn.innerHTML = wa.state === "switching"
+  const restartWaButton = document.getElementById("restart-wa-btn");
+  restartWaButton.disabled = wa.state === "recovery_required" || wa.state === "switching" || wa.state === "switching_elsewhere";
+  restartWaButton.innerHTML = !data.can_manage
+    ? "🔐 Administrar WA"
+    : wa.reauth_required
+      ? "📲 Volver a vincular WA"
+      : "🔄 Reiniciar servicio WA";
+  waBtn.disabled = wa.state === "recovery_required" || wa.state === "switching";
+  waBtn.innerHTML = !data.can_manage
+    ? "🔐 Recuperar acceso"
+    : wa.state === "switching"
     ? "⏳ Cambio en curso…"
+    : wa.state === "switching_elsewhere"
+      ? "↪️ Continuar vinculación aquí"
     : wa.reauth_required
       ? "📲 Volver a vincular"
       : wa.linked ? "🔁 Cambiar cuenta" : "📲 Vincular WhatsApp";
@@ -762,9 +809,15 @@ function renderChannelState(data) {
     : (data.can_manage
         ? "Todavía no hay una cuenta vinculada."
         : "Vincula Telegram primero para habilitar la administración segura.");
-  if (wa.state === "recovery_required") {
+  if (!data.can_manage) {
+    document.getElementById("wa-link-status").innerHTML =
+      "🔐 Para administrar WhatsApp o generar un QR, pulsa <strong>Recuperar acceso</strong> y confirma arriba las credenciales actuales de Telegram.";
+  } else if (wa.state === "recovery_required") {
     document.getElementById("wa-link-status").innerHTML =
       "❌ El cambio requiere recuperación manual. El respaldo se mantiene protegido.";
+  } else if (wa.state === "switching_elsewhere") {
+    document.getElementById("wa-link-status").innerHTML =
+      "⏳ Hay un cambio iniciado en otro navegador. Puedes terminarlo allí o pulsar <strong>Continuar vinculación aquí</strong>.";
   } else if (wa.state !== "switching") {
     const waStatus = document.getElementById("wa-link-status");
     if (wa.reauth_required) {
@@ -776,20 +829,32 @@ function renderChannelState(data) {
     }
   }
   if (wa.state === "switching" && !waSwitchPolling) {
-    document.getElementById("wa-qr-card").style.display = "block";
+    revealWaQrCard(true);
+    if (data.qr_ready) {
+      document.getElementById("wa-qr-img").src = "/api/switch_wa/qr?ts=" + Date.now();
+    }
     beginWaSwitchPolling();
+  } else if (wa.state === "switching_elsewhere") {
+    document.getElementById("wa-qr-card").style.display = "none";
   }
 }
 
-async function loadChannelState() {
-  try {
-    const r = await fetch("/api/channels", {cache: "no-store"});
-    const data = await r.json();
-    if (r.ok && data.ok) renderChannelState(data);
-    return data;
-  } catch(e) {
-    return null;
-  }
+async function loadChannelState(force=false) {
+  if (channelStateRequest && force) await channelStateRequest;
+  if (channelStateRequest) return channelStateRequest;
+  channelStateRequest = (async () => {
+    try {
+      const r = await fetch("/api/channels", {cache: "no-store"});
+      const data = await r.json();
+      if (r.ok && data.ok) renderChannelState(data);
+      return data;
+    } catch(e) {
+      return null;
+    } finally {
+      channelStateRequest = null;
+    }
+  })();
+  return channelStateRequest;
 }
 
 async function showSetup() {
@@ -984,12 +1049,24 @@ async function linkTelegram() {
       document.getElementById("tg-link-status").innerHTML = `📨 ${prefix} No solicites otro hasta que termine la espera.`;
       armTgRetry(d.retry_after ?? d.timeout_seconds ?? 30);
     } else if (d.ok) {
+      const recoveredAdmin = Boolean(d.already_authorized);
       clearTgAttempt();
       document.getElementById("tg-api-hash").value = '';
-      toast("✅ Vinculado. El bot se conectará como usuario.", "success");
-      document.getElementById("tg-link-status").innerHTML = '✅ <strong>Sesión autorizada; iniciando Telegram…</strong>';
-      await loadChannelState();
-      setTimeout(() => document.getElementById("setup-modal").style.display = 'none', 1500);
+      toast(
+        recoveredAdmin
+          ? "✅ Acceso administrativo recuperado"
+          : "✅ Vinculado. El bot se conectará como usuario.",
+        "success"
+      );
+      document.getElementById("tg-link-status").innerHTML = recoveredAdmin
+        ? '✅ <strong>Acceso recuperado. Ya puedes volver a vincular WhatsApp.</strong>'
+        : '✅ <strong>Sesión autorizada; iniciando Telegram…</strong>';
+      await loadChannelState(true);
+      if (recoveredAdmin) {
+        requestAnimationFrame(() => document.getElementById("wa-switch-btn").scrollIntoView({behavior: "smooth", block: "center"}));
+      } else {
+        setTimeout(() => document.getElementById("setup-modal").style.display = 'none', 1500);
+      }
       btn.disabled = false;
       btn.innerHTML = '🔗 Vincular';
     } else {
@@ -1155,8 +1232,24 @@ function beginWaSwitchPolling() {
   pollWaSwitch(waSwitchGeneration);
 }
 
-async function startWaSwitch() {
-  const current = (channelState && channelState.whatsapp) || {};
+async function startWaSwitch(knownState=null) {
+  const latest = knownState || await loadChannelState();
+  if (!latest) {
+    toast("❌ No fue posible consultar el estado de los canales", "error");
+    return;
+  }
+  if (!latest.can_manage) {
+    guideChannelAdminRecovery();
+    return;
+  }
+  const current = latest.whatsapp || {};
+  if (current.state === "switching_elsewhere") {
+    const accepted = confirm(
+      "Hay una vinculación abierta en otro navegador. ¿Quieres continuarla de forma segura aquí?"
+    );
+    if (accepted) await claimWaSwitch();
+    return;
+  }
   const linked = Boolean(current.linked);
   const ready = Boolean(current.ready);
   const question = linked
@@ -1180,13 +1273,22 @@ async function startWaSwitch() {
     });
     const d = await r.json();
     if (r.ok && d.ok) {
-      document.getElementById("wa-qr-card").style.display = "block";
-      document.getElementById("wa-qr-img").removeAttribute("src");
+      revealWaQrCard(true);
       document.getElementById("wa-qr-help").textContent = "Preparando un QR seguro…";
       beginWaSwitchPolling();
-    } else if (d.error_code === "switch_in_progress") {
-      document.getElementById("wa-qr-card").style.display = "block";
+    } else if (d.error_code === "switch_in_progress" && d.owned_by_this_browser === true) {
+      revealWaQrCard();
       beginWaSwitchPolling();
+    } else if (d.error_code === "switch_in_progress") {
+      btn.disabled = false;
+      const accepted = confirm(
+        "Ya hay una vinculación abierta en otro navegador. ¿Quieres continuarla de forma segura en este navegador?"
+      );
+      if (accepted) await claimWaSwitch();
+      else {
+        document.getElementById("wa-link-status").textContent =
+          "El intento anterior sigue protegido. Puedes terminarlo en el otro navegador o reintentar cuando venza.";
+      }
     } else {
       btn.disabled = false;
       document.getElementById("wa-link-status").innerHTML = "❌ " + (d.error || "Error");
@@ -1195,6 +1297,35 @@ async function startWaSwitch() {
   } catch(e) {
     btn.disabled = false;
     document.getElementById("wa-link-status").innerHTML = "❌ Error: " + e.message;
+  }
+}
+
+async function claimWaSwitch() {
+  const button = document.getElementById("wa-switch-btn");
+  button.disabled = true;
+  document.getElementById("wa-link-status").textContent = "Transfiriendo la vinculación a este navegador…";
+  try {
+    const response = await fetch("/api/switch_wa/claim", {
+      method: "POST",
+      headers: channelHeaders(),
+      body: JSON.stringify({confirm: true})
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || "No fue posible continuar la vinculación");
+    revealWaQrCard(true);
+    if (data.qr_ready) {
+      document.getElementById("wa-qr-img").src = "/api/switch_wa/qr?ts=" + Date.now();
+    }
+    document.getElementById("wa-qr-help").textContent = data.qr_ready
+      ? "Escanea este QR. Confirmaremos el cambio automáticamente."
+      : "Preparando un QR seguro…";
+    beginWaSwitchPolling();
+  } catch(error) {
+    button.disabled = false;
+    document.getElementById("wa-qr-card").style.display = "none";
+    document.getElementById("wa-link-status").textContent = "❌ " + error.message;
+    toast("⚠️ " + error.message, "error");
+    await loadChannelState();
   }
 }
 
@@ -1307,6 +1438,10 @@ async function cancelWaSwitch() {
 loadData();
 loadChannelState();
 setInterval(loadData, 10000);
+setInterval(loadChannelState, 10000);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") loadChannelState();
+});
 // Auto-iniciar BotFather si hay token configurado
 fetch("/api/start_botfather", {method:"POST"}).catch(()=>{});
 </script>
@@ -2040,7 +2175,7 @@ def _read_wa_call_health(file_path: Path = WA_CALL_HEALTH_FILE):
 @app.route("/api/wa_call_health")
 def api_wa_call_health():
     """Returns only an allowlisted, identifier-free call pipeline snapshot."""
-    health = _read_wa_call_health()
+    health = _read_wa_call_health(WA_CALL_HEALTH_FILE)
     worker_running = _wa_process_running(DATA_DIR / "wa_bot.pid")
     health["worker_running"] = worker_running
     if not worker_running:
@@ -2973,6 +3108,11 @@ def _schedule_wa_switch_expiry(operation: dict) -> None:
         _wa_switch_expiry_timer.cancel()
     expected_hash = operation["token_hash"]
     expected_started_at = operation["started_at"]
+    try:
+        elapsed = max(0.0, time.time() - float(expected_started_at))
+    except (TypeError, ValueError):
+        elapsed = WA_SWITCH_TIMEOUT_SECONDS
+    remaining = max(0.01, WA_SWITCH_TIMEOUT_SECONDS - elapsed)
 
     def expire() -> None:
         global _wa_switch_expiry_timer
@@ -2986,7 +3126,7 @@ def _schedule_wa_switch_expiry(operation: dict) -> None:
                 _cleanup_wa_switch_files()
             _wa_switch_expiry_timer = None
 
-    timer = threading.Timer(WA_SWITCH_TIMEOUT_SECONDS, expire)
+    timer = threading.Timer(remaining, expire)
     timer.daemon = True
     _wa_switch_expiry_timer = timer
     timer.start()
@@ -3143,6 +3283,20 @@ def api_restart_wa_bot():
     security_error = _channel_mutation_error()
     if security_error:
         return security_error
+    health = _read_wa_call_health(WA_CALL_HEALTH_FILE)
+    connection_open = (
+        _wa_process_running(DATA_DIR / "wa_bot.pid")
+        and health.get("connection") == "open"
+    )
+    reauth_required = bool(health.get("reauth_required")) or health.get(
+        "disconnect_reason"
+    ) in {"logged_out", "session_invalid"}
+    if not connection_open and reauth_required:
+        return jsonify({
+            "ok": False,
+            "error_code": "reauth_required",
+            "error": "WhatsApp cerró esta sesión. Usa «Volver a vincular» para generar un QR nuevo.",
+        }), 409
     try:
         pid = restart_wa_bot()
         if not pid:
@@ -3167,7 +3321,9 @@ def api_switch_wa():
     security_error = _channel_mutation_error()
     if security_error:
         return security_error
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "No se recibió una solicitud válida."}), 400
     if data.get("confirm") is not True:
         return jsonify({"ok": False, "error": "Confirma el cambio de cuenta."}), 400
 
@@ -3182,12 +3338,27 @@ def api_switch_wa():
                 "error_code": "recovery_required",
                 "error": "Hay un respaldo pendiente de recuperación manual; no se inició otro cambio.",
             }), 409
-        if existing and time.time() - float(existing.get("started_at", 0)) < WA_SWITCH_TIMEOUT_SECONDS:
-            return jsonify({
-                "ok": False,
-                "error_code": "switch_in_progress",
-                "error": "Ya hay un cambio de WhatsApp en curso.",
-            }), 409
+        if existing:
+            try:
+                elapsed = max(0.0, time.time() - float(existing.get("started_at", 0)))
+            except (TypeError, ValueError):
+                elapsed = WA_SWITCH_TIMEOUT_SECONDS
+            if elapsed < WA_SWITCH_TIMEOUT_SECONDS and _wa_process_running(WA_SWITCH_PID_FILE):
+                owned = _wa_switch_owned(existing)
+                return jsonify({
+                    "ok": False,
+                    "state": "switching" if owned else "switching_elsewhere",
+                    "error_code": "switch_in_progress",
+                    "owned_by_this_browser": owned,
+                    "retry_after": max(1, int(WA_SWITCH_TIMEOUT_SECONDS - elapsed)),
+                    "error": (
+                        "Ya hay un cambio de WhatsApp en curso en este navegador."
+                        if owned
+                        else "Ya hay una vinculación de WhatsApp abierta en otro navegador."
+                    ),
+                }), 409
+            # Un worker candidato muerto no debe bloquear un QR nuevo hasta
+            # que venza el TTL. La limpieza siguiente sólo toca el staging.
         _cleanup_wa_switch_candidate()
         _secure_directory(WA_SWITCH_AUTH_DIR)
         token = secrets.token_urlsafe(32)
@@ -3214,6 +3385,60 @@ def api_switch_wa():
             _cleanup_wa_switch_candidate()
             return jsonify({"ok": False, "error": "No fue posible preparar el QR."}), 503
     return jsonify({"ok": True, "state": "preparing"}), 202
+
+
+@app.route("/api/switch_wa/claim", methods=["POST"])
+def api_switch_wa_claim():
+    """Transfiere a otro navegador administrador un emparejamiento vigente."""
+
+    security_error = _channel_mutation_error()
+    if security_error:
+        return security_error
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "No se recibió una solicitud válida."}), 400
+    if data.get("confirm") is not True:
+        return jsonify({"ok": False, "error": "Confirma que deseas continuar la vinculación aquí."}), 400
+
+    with _wa_switch_lock:
+        _reap_expired_wa_switch()
+        operation = _load_wa_switch_operation()
+        if _whatsapp_recovery_pending() or (
+            operation and operation.get("status") == "recovery_required"
+        ):
+            return jsonify({
+                "ok": False,
+                "error_code": "recovery_required",
+                "error": "Hay un respaldo pendiente de recuperación manual.",
+            }), 409
+        if not operation:
+            return jsonify({
+                "ok": False,
+                "error_code": "switch_missing",
+                "error": "La vinculación anterior ya terminó o venció. Inicia un QR nuevo.",
+            }), 404
+        if not _wa_process_running(WA_SWITCH_PID_FILE):
+            _cleanup_wa_switch_candidate()
+            return jsonify({
+                "ok": False,
+                "error_code": "candidate_stopped",
+                "error": "El intento anterior se detuvo. Pulsa nuevamente para generar un QR nuevo.",
+            }), 410
+
+        token = secrets.token_urlsafe(32)
+        operation["token_hash"] = _wa_switch_token_digest(token)
+        _save_wa_switch_operation(operation)
+        _schedule_wa_switch_expiry(operation)
+        session["wa_switch_token"] = token
+        session.permanent = True
+        qr_ready = WA_SWITCH_QR_FILE.is_file()
+        scanned = _wa_connection_open(WA_SWITCH_PID_FILE, WA_SWITCH_HEALTH_FILE)
+        return jsonify({
+            "ok": True,
+            "state": "scanned" if scanned else ("awaiting_qr" if qr_ready else "preparing"),
+            "qr_ready": qr_ready,
+            "ready_to_commit": scanned,
+        })
 
 
 @app.route("/api/switch_wa/status")
@@ -3340,18 +3565,24 @@ def api_channels():
     wa_auth_present = WA_AUTH_DIR.exists() and any(WA_AUTH_DIR.iterdir())
     wa_worker_running = _wa_process_running(DATA_DIR / "wa_bot.pid")
     wa_ready = _wa_connection_open()
-    wa_health = _read_wa_call_health()
+    wa_health = _read_wa_call_health(WA_CALL_HEALTH_FILE)
     wa_identity = _read_safe_identity(WA_IDENTITY_FILE)
     with _wa_switch_lock:
         _reap_expired_wa_switch()
         wa_operation = _load_wa_switch_operation()
-    wa_switching = bool(wa_operation and _wa_switch_owned(wa_operation))
+    wa_switch_active = bool(wa_operation)
+    wa_switch_owned = bool(wa_operation and _wa_switch_owned(wa_operation))
+    wa_switch_elsewhere = bool(can_manage and wa_switch_active and not wa_switch_owned)
     tg_recovery_required = _telegram_recovery_pending()
     wa_recovery_required = _whatsapp_recovery_pending() or bool(
         wa_operation and wa_operation.get("status") == "recovery_required"
     )
+    wa_reauth_required = bool(wa_auth_present) and not wa_ready and (
+        bool(wa_health.get("reauth_required"))
+        or wa_health.get("disconnect_reason") in {"logged_out", "session_invalid"}
+    )
 
-    return jsonify({
+    response = jsonify({
         "ok": True,
         "csrf": _channel_csrf_token(),
         "can_manage": can_manage,
@@ -3369,14 +3600,25 @@ def api_channels():
             "linked": wa_auth_present,
             "ready": wa_ready,
             "worker_running": wa_worker_running,
-            "state": "recovery_required" if wa_recovery_required else "switching" if wa_switching else (
-                "ready" if wa_ready else ("offline" if wa_auth_present else "unlinked")
+            "state": (
+                "recovery_required" if wa_recovery_required
+                else "switching" if wa_switch_owned
+                else "switching_elsewhere" if wa_switch_elsewhere
+                else "reauth_required" if wa_reauth_required
+                else "ready" if wa_ready
+                else "offline" if wa_auth_present
+                else "unlinked"
             ),
             "display_name": wa_identity.get("display_name") if wa_auth_present and can_manage else None,
             "phone_hint": wa_identity.get("phone_hint") if wa_auth_present and can_manage else None,
-            "reauth_required": wa_health.get("reauth_required", False) if can_manage else False,
+            "reauth_required": wa_reauth_required,
+            "switch_in_progress": wa_switch_active if can_manage else False,
+            "switch_owned_by_this_browser": wa_switch_owned if can_manage else False,
         },
     })
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["Pragma"] = "no-cache"
+    return response
 
 
 @app.route("/api/start_botfather", methods=["POST"])
