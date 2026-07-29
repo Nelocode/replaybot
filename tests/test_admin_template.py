@@ -71,12 +71,108 @@ class AdminTemplateTestCase(unittest.TestCase):
         self.assertIn("let channelStateRequest = null;", template)
         self.assertIn("setInterval(loadChannelState, 10000);", template)
         self.assertIn('document.addEventListener("visibilitychange"', template)
-        self.assertIn("function guideChannelAdminRecovery()", template)
-        self.assertIn("🔐 Recuperar acceso", template)
-        self.assertIn("const recoveredAdmin = Boolean(d.already_authorized);", template)
-        self.assertIn("Ya puedes volver a vincular WhatsApp", template)
+        self.assertIn("function openAdminAccessVerification()", template)
+        self.assertIn("🔐 Verificar navegador", template)
+        self.assertIn("Telegram sigue conectado", template)
+        self.assertNotIn("function guideChannelAdminRecovery()", template)
         self.assertIn("latest.whatsapp.reauth_required", template)
         self.assertIn("necesitas un QR nuevo", template)
+
+    def test_linked_telegram_uses_otp_instead_of_credentials(self):
+        template = app_module.TEMPLATE
+        self.assertIn('id="admin-access"', template)
+        self.assertIn("Enviar código a Telegram", template)
+        self.assertIn('id="admin-access-code"', template)
+        self.assertIn('pattern="[0-9]{8}"', template)
+        self.assertIn('maxlength="8"', template)
+        self.assertIn('autocomplete="one-time-code"', template)
+
+        linked_state = re.search(
+            r'if \(tg\.linked\) \{(?P<linked>.*?)\n  \} else \{(?P<unlinked>.*?)'
+            r'\n  \}\n\n  const wa',
+            template,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(linked_state)
+        self.assertIn('tgInitial.style.display = "none";', linked_state.group("linked"))
+        self.assertIn(
+            'tgLinked.style.display = data.can_manage ? "block" : "none";',
+            linked_state.group("linked"),
+        )
+        self.assertIn(
+            'adminAccess.style.display = data.can_manage ? "none" : "block";',
+            linked_state.group("linked"),
+        )
+        self.assertNotIn('tgInitial.style.display = "block";', linked_state.group("linked"))
+        self.assertIn('tgInitial.style.display = "block";', linked_state.group("unlinked"))
+        self.assertIn('adminAccess.style.display = "none";', linked_state.group("unlinked"))
+
+        link_telegram = re.search(
+            r'async function linkTelegram\(\) \{(?P<body>.*?)'
+            r'\n\}\n\nasync function verifyTgCode',
+            template,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(link_telegram)
+        self.assertNotIn("already_authorized", link_telegram.group("body"))
+        self.assertNotIn("recoveredAdmin", link_telegram.group("body"))
+        self.assertIn("admin_verification_required", link_telegram.group("body"))
+
+    def test_admin_access_flow_uses_csrf_and_refreshes_rotated_token(self):
+        template = app_module.TEMPLATE
+        for endpoint in (
+            "/api/admin_access/request",
+            "/api/admin_access/status",
+            "/api/admin_access/verify",
+            "/api/admin_access/cancel",
+        ):
+            self.assertIn(endpoint, template)
+
+        request_flow = re.search(
+            r'async function requestAdminAccess\(\) \{(?P<body>.*?)'
+            r'\n\}\n\nasync function verifyAdminAccess',
+            template,
+            re.DOTALL,
+        )
+        verify_flow = re.search(
+            r'async function verifyAdminAccess\(\) \{(?P<body>.*?)'
+            r'\n\}\n\nasync function cancelAdminAccess',
+            template,
+            re.DOTALL,
+        )
+        cancel_flow = re.search(
+            r'async function cancelAdminAccess\(\) \{(?P<body>.*?)'
+            r'\n\}\n\nfunction revealWaQrCard',
+            template,
+            re.DOTALL,
+        )
+        for flow in (request_flow, verify_flow, cancel_flow):
+            self.assertIsNotNone(flow)
+            self.assertIn("headers: channelHeaders()", flow.group("body"))
+
+        self.assertIn(
+            'fetch("/api/admin_access/status", {cache: "no-store"})', template
+        )
+        self.assertIn("if (!/^\\d{8}$/.test(code))", verify_flow.group("body"))
+        self.assertIn("channelCsrf = data.csrf || null;", verify_flow.group("body"))
+        self.assertIn("await loadChannelState(true);", verify_flow.group("body"))
+        self.assertIn("if (latest && latest.csrf) channelCsrf = latest.csrf;", verify_flow.group("body"))
+        self.assertIn("expired_code", template)
+        self.assertIn("delivery_retrying", template)
+        self.assertIn("retry_after", template)
+
+    def test_every_panel_mutation_uses_the_central_csrf_headers(self):
+        template = app_module.TEMPLATE
+        self.assertNotIn('headers: {"Content-Type": "application/json"}', template)
+        self.assertIn("function channelUploadHeaders()", template)
+        self.assertIn(
+            'fetch("/api/upload_chunk", {\n        method: "POST",\n        headers: channelUploadHeaders()',
+            template,
+        )
+        self.assertNotIn(
+            'fetch("/api/start_botfather", {method:"POST"})',
+            template,
+        )
 
     def test_foreign_whatsapp_switch_never_polls_before_it_is_claimed(self):
         template = app_module.TEMPLATE
@@ -122,7 +218,7 @@ class AdminTemplateTestCase(unittest.TestCase):
             re.DOTALL,
         )
         self.assertIsNotNone(admin_guard)
-        self.assertIn("guideChannelAdminRecovery();", admin_guard.group("body"))
+        self.assertIn("openAdminAccessVerification();", admin_guard.group("body"))
         self.assertIn("return;", admin_guard.group("body"))
 
 

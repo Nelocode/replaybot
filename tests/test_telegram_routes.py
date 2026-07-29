@@ -16,6 +16,10 @@ class TelegramRoutesTestCase(unittest.TestCase):
     def setUp(self):
         app_module.app.config.update(TESTING=True)
         self.client = app_module.app.test_client()
+        self.csrf = "t" * 48
+        with self.client.session_transaction() as browser_session:
+            browser_session["channel_csrf"] = self.csrf
+        self.client.environ_base["HTTP_X_CHANNEL_CSRF"] = self.csrf
 
     def assert_response_does_not_contain_secrets(self, response, *secrets):
         body = response.get_data(as_text=True)
@@ -193,7 +197,7 @@ class TelegramRoutesTestCase(unittest.TestCase):
         self.assertTrue(data["authorized"])
         self.assertTrue(data["worker_starting"])
         with self.client.session_transaction() as browser_session:
-            self.assertTrue(browser_session.get("telegram_admin"))
+            self.assertTrue(browser_session.get("channel_admin"))
             self.assertTrue(browser_session.permanent)
         manager.verify_code.assert_called_once_with(self.CODE, self.ATTEMPT)
         save_creds.assert_called_once_with(
@@ -213,7 +217,7 @@ class TelegramRoutesTestCase(unittest.TestCase):
         self.assertFalse(response.get_json()["ok"])
         restart.assert_not_called()
 
-    def test_admin_browser_can_be_recovered_with_matching_saved_credentials(self):
+    def test_linked_telegram_credentials_cannot_authenticate_the_panel(self):
         payload = {
             "api_id": self.API_ID,
             "api_hash": self.API_HASH,
@@ -221,39 +225,39 @@ class TelegramRoutesTestCase(unittest.TestCase):
         }
         with (
             patch.object(app_module, "_telegram_session_is_authorized", return_value=True),
-            patch.object(app_module, "_telegram_credentials_match_saved", return_value=True),
-            patch.object(
-                app_module,
-                "restart_telegram_worker",
-                return_value=(True, "Telegram iniciado"),
-            ) as restart,
-        ):
-            response = self.client.post("/api/link_telegram", json=payload)
-
-        self.assertEqual(200, response.status_code)
-        self.assertTrue(response.get_json()["ok"])
-        restart.assert_called_once_with()
-        with self.client.session_transaction() as browser_session:
-            self.assertTrue(browser_session.get("telegram_admin"))
-            self.assertTrue(browser_session.permanent)
-
-    def test_admin_recovery_does_not_restart_an_online_telegram_worker(self):
-        payload = {
-            "api_id": self.API_ID,
-            "api_hash": self.API_HASH,
-            "phone": self.PHONE,
-        }
-        with (
-            patch.object(app_module, "_telegram_session_is_authorized", return_value=True),
-            patch.object(app_module, "_telegram_credentials_match_saved", return_value=True),
-            patch.object(app_module, "bot_is_running", return_value=True),
+            patch.object(app_module, "_telegram_auth") as manager,
             patch.object(app_module, "restart_telegram_worker") as restart,
         ):
             response = self.client.post("/api/link_telegram", json=payload)
 
-        self.assertEqual(200, response.status_code)
-        self.assertTrue(response.get_json()["ok"])
-        self.assertIn("sigue en línea", response.get_json()["message"])
+        self.assertEqual(409, response.status_code)
+        self.assertEqual(
+            "admin_verification_required",
+            response.get_json()["error_code"],
+        )
+        manager.begin.assert_not_called()
+        restart.assert_not_called()
+        with self.client.session_transaction() as browser_session:
+            self.assertFalse(browser_session.get("channel_admin"))
+
+    def test_admin_browser_uses_change_account_instead_of_relinking(self):
+        payload = {
+            "api_id": self.API_ID,
+            "api_hash": self.API_HASH,
+            "phone": self.PHONE,
+        }
+        with self.client.session_transaction() as browser_session:
+            browser_session["channel_admin"] = True
+        with (
+            patch.object(app_module, "_telegram_session_is_authorized", return_value=True),
+            patch.object(app_module, "_telegram_auth") as manager,
+            patch.object(app_module, "restart_telegram_worker") as restart,
+        ):
+            response = self.client.post("/api/link_telegram", json=payload)
+
+        self.assertEqual(409, response.status_code)
+        self.assertEqual("already_linked", response.get_json()["error_code"])
+        manager.begin.assert_not_called()
         restart.assert_not_called()
 
 

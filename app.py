@@ -19,6 +19,7 @@ from pathlib import Path
 from flask import Flask, render_template_string, request, jsonify, send_from_directory, session
 from telegram_auth import TelegramAuthManager
 from message_schema import load_message_file
+from panel_admin_access import PanelAdminAccessStore
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
@@ -39,6 +40,7 @@ WA_SWITCH_IDENTITY_FILE = WA_SWITCH_DIR / "identity.json"
 WA_SWITCH_PID_FILE = WA_SWITCH_DIR / "worker.pid"
 WA_SWITCH_OPERATION_FILE = WA_SWITCH_DIR / "operation.json"
 WA_SWITCH_RECOVERY_ROOT = DATA_DIR / ".wa_switch_recovery"
+PANEL_ADMIN_ACCESS_DIR = DATA_DIR / "panel_admin_access"
 WA_SWITCH_TIMEOUT_SECONDS = 180
 
 def _load_or_create_flask_secret() -> str:
@@ -73,6 +75,7 @@ app.config.update(
     SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "1") != "0",
 )
 app.permanent_session_lifetime = timedelta(days=365)
+_panel_admin_access = PanelAdminAccessStore(PANEL_ADMIN_ACCESS_DIR, APP_SECRET)
 
 # ── Telethon auth state (para flujo interactivo desde el panel) ──────
 # Conserva un solo event loop entre send_code_request, sign_in y 2FA.
@@ -159,7 +162,7 @@ label { color: #c8c8e0 !important; font-weight: 500; }
 
       <!-- ── Telegram ── -->
       <h6 class="mb-2">📱 Telegram (User Bot)</h6>
-      <details class="mb-2">
+      <details id="tg-credentials-help" class="mb-2" style="display:none;">
         <summary class="text-muted small" style="cursor:pointer;">📖 ¿Cómo obtener las credenciales?</summary>
         <ol class="small mt-2" style="padding-left:1.5rem;">
           <li>Ve a <a href="https://my.telegram.org/apps" target="_blank" style="color:#6ea8fe;">my.telegram.org/apps</a></li>
@@ -168,7 +171,7 @@ label { color: #c8c8e0 !important; font-weight: 500; }
           <li>Copia el <strong>api_id</strong> y <strong>api_hash</strong> de abajo</li>
         </ol>
       </details>
-      <div id="tg-initial-link">
+      <div id="tg-initial-link" style="display:none;">
         <div class="row mb-2">
           <div class="col-3">
             <input id="tg-api-id" type="number" class="form-control form-control-sm" placeholder="api_id" style="font-family:monospace;font-size:0.8rem;">
@@ -187,6 +190,28 @@ label { color: #c8c8e0 !important; font-weight: 500; }
       <div id="tg-linked-actions" style="display:none;" class="p-2 mb-2 rounded" >
         <div id="tg-account-summary" class="small mb-2"></div>
         <button id="tg-switch-open-btn" class="btn btn-sm btn-primary" onclick="showTelegramSwitch()">🔁 Cambiar cuenta</button>
+      </div>
+      <div id="admin-access" style="display:none;" class="p-3 mb-3 rounded border border-warning">
+        <h6 class="mb-1">🔐 Telegram sigue conectado</h6>
+        <p class="small text-muted mb-2">
+          Verifica este navegador para administrar los canales. Enviaremos un código de un solo uso
+          a los Mensajes guardados de la cuenta de Telegram activa; la cuenta no se reiniciará ni cambiará.
+        </p>
+        <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+          <button id="admin-access-request-btn" class="btn btn-sm btn-primary" onclick="requestAdminAccess()">📨 Enviar código a Telegram</button>
+        </div>
+        <div id="admin-access-code-section" style="display:none;">
+          <label for="admin-access-code" class="small mb-1">Código de 8 dígitos</label>
+          <div class="d-flex flex-wrap gap-2">
+            <input id="admin-access-code" type="text" inputmode="numeric" autocomplete="one-time-code"
+                   pattern="[0-9]{8}" maxlength="8" class="form-control form-control-sm"
+                   placeholder="00000000" aria-describedby="admin-access-status"
+                   style="font-family:monospace;font-size:1.1rem;letter-spacing:4px;text-align:center;max-width:220px;">
+            <button id="admin-access-verify-btn" class="btn btn-sm btn-success" onclick="verifyAdminAccess()">✅ Verificar</button>
+            <button id="admin-access-cancel-btn" class="btn btn-sm btn-outline-light" onclick="cancelAdminAccess()">✕ Cancelar</button>
+          </div>
+        </div>
+        <div id="admin-access-status" class="small text-muted mt-2" role="status" aria-live="polite"></div>
       </div>
       <div id="tg-switch-section" style="display:none;" class="p-2 mb-2 rounded">
         <p class="small text-muted mb-2">La cuenta actual seguirá atendiendo hasta verificar la nueva. Reutilizaremos el api_id y api_hash guardados.</p>
@@ -333,6 +358,12 @@ let waCommitInFlight = false;
 let waSwitchGeneration = 0;
 let waSwitchPollAbortController = null;
 let channelStateRequest = null;
+let adminAccessPollTimer = null;
+let adminAccessCountdownTimer = null;
+let adminAccessStatusRequest = null;
+let adminAccessPolling = false;
+let adminAccessExpiresAt = 0;
+let adminAccessRetryAt = 0;
 
 function toast(msg, type="success") {
   const c = document.getElementById("toast-container");
@@ -452,18 +483,20 @@ function switchLang(lang) {
 }
 
 async function saveStepLoop(lang, step, loop) {
+  if (!requirePanelAdmin()) return;
   await fetch("/api/messages", {
     method: "POST",
-    headers: {"Content-Type": "application/json"},
+    headers: channelHeaders(),
     body: JSON.stringify({lang, step, loop, action: "edit_loop"})
   });
 }
 
 async function saveStepText(lang, step, text) {
+  if (!requirePanelAdmin()) return;
   try {
     const r = await fetch("/api/messages", {
       method: "POST",
-      headers: {"Content-Type": "application/json"},
+      headers: channelHeaders(),
       body: JSON.stringify({lang, step, text, action: "edit_text"})
     });
     const resp = await r.json();
@@ -476,11 +509,13 @@ async function saveStepText(lang, step, text) {
 
 async function uploadAudio(lang, step, file) {
   if (!file) return;
+  if (!requirePanelAdmin()) return;
   await uploadFileChunked(file, lang, {step, type: "step"});
 }
 
 async function uploadCallAudio(lang, file) {
   if (!file) return;
+  if (!requirePanelAdmin()) return;
   await uploadFileChunked(file, lang, {type: "call"});
 }
 
@@ -499,7 +534,11 @@ async function uploadFileChunked(file, lang, opts = {}) {
     fd.append("type", opts.type || "step");
 
     try {
-      const r = await fetch("/api/upload_chunk", { method: "POST", body: fd });
+      const r = await fetch("/api/upload_chunk", {
+        method: "POST",
+        headers: channelUploadHeaders(),
+        body: fd
+      });
       const resp = await r.json();
       if (!resp.ok) {
         toast("❌ Chunk " + (i+1) + "/" + totalChunks + ": " + resp.error, "error");
@@ -522,7 +561,7 @@ async function uploadFileChunked(file, lang, opts = {}) {
   try {
     const r = await fetch("/api/upload_assemble", {
       method: "POST",
-      headers: {"Content-Type": "application/json"},
+      headers: channelHeaders(),
       body
     });
     const resp = await r.json();
@@ -538,10 +577,11 @@ async function uploadFileChunked(file, lang, opts = {}) {
 }
 
 async function addStep(lang) {
+  if (!requirePanelAdmin()) return;
   try {
     const r = await fetch("/api/messages", {
       method: "POST",
-      headers: {"Content-Type": "application/json"},
+      headers: channelHeaders(),
       body: JSON.stringify({lang, action: "add_step"})
     });
     const resp = await r.json();
@@ -553,11 +593,12 @@ async function addStep(lang) {
 }
 
 async function removeStep(lang, step) {
+  if (!requirePanelAdmin()) return;
   if (!confirm("¿Eliminar paso " + (step+1) + " de " + LANG_NAMES[lang] + "?")) return;
   try {
     const r = await fetch("/api/messages", {
       method: "POST",
-      headers: {"Content-Type": "application/json"},
+      headers: channelHeaders(),
       body: JSON.stringify({lang, step, action: "remove_step"})
     });
     const resp = await r.json();
@@ -574,10 +615,11 @@ function previewLang(lang) {
 }
 
 async function saveCallText(lang, text) {
+  if (!requirePanelAdmin()) return;
   try {
     const r = await fetch("/api/messages", {
       method: "POST",
-      headers: {"Content-Type": "application/json"},
+      headers: channelHeaders(),
       body: JSON.stringify({lang, text, action: "edit_call_text"})
     });
     const resp = await r.json();
@@ -589,6 +631,11 @@ async function saveCallText(lang, text) {
 }
 
 async function restartBot() {
+  const latest = await loadChannelState();
+  if (!latest || !latest.can_manage) {
+    openAdminAccessVerification();
+    return;
+  }
   if (!confirm("¿Reiniciar el bot de Telegram? (toma efecto inmediato)")) return;
   toast("🔄 Reiniciando bot TG...", "success");
   try {
@@ -630,7 +677,7 @@ async function restartWaBot() {
     return;
   }
   if (!latest.can_manage) {
-    guideChannelAdminRecovery();
+    openAdminAccessVerification();
     return;
   }
   if (latest.whatsapp && latest.whatsapp.reauth_required) {
@@ -727,6 +774,18 @@ function channelHeaders() {
   return headers;
 }
 
+function channelUploadHeaders() {
+  const headers = {};
+  if (channelCsrf) headers["X-Channel-CSRF"] = channelCsrf;
+  return headers;
+}
+
+function requirePanelAdmin() {
+  if (channelState && channelState.can_manage) return true;
+  openAdminAccessVerification();
+  return false;
+}
+
 function safeAccountLabel(account, fallback) {
   const parts = [];
   if (account && account.display_name) parts.push(account.display_name);
@@ -735,17 +794,314 @@ function safeAccountLabel(account, fallback) {
   return parts.length ? parts.join(" · ") : fallback;
 }
 
-function guideChannelAdminRecovery() {
+function adminAccessState(data) {
+  if (!data || typeof data !== "object") return "idle";
+  const raw = String(data.state || data.status || data.error_code || "");
+  const aliases = {
+    sent: "delivered",
+    delivery_retrying: "queued",
+    no_active_challenge: "missing",
+    expired_code: "expired",
+    attempts_exhausted: "locked"
+  };
+  if (aliases[raw]) return aliases[raw];
+  if (raw) return raw;
+  if (data.delivered) return "delivered";
+  if (data.pending) return "pending";
+  return "idle";
+}
+
+function adminAccessDeadline(data, absoluteKey, relativeKeys) {
+  const absolute = data && data[absoluteKey];
+  if (typeof absolute === "number" && Number.isFinite(absolute)) {
+    return absolute > 1000000000000 ? absolute : absolute * 1000;
+  }
+  if (typeof absolute === "string") {
+    const parsed = Date.parse(absolute);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  for (const key of relativeKeys) {
+    const seconds = Number(data && data[key]);
+    if (Number.isFinite(seconds) && seconds > 0) return Date.now() + seconds * 1000;
+  }
+  return 0;
+}
+
+function adminAccessSeconds(deadline) {
+  return deadline ? Math.max(0, Math.ceil((deadline - Date.now()) / 1000)) : 0;
+}
+
+function setAdminAccessStatus(message, type="muted") {
+  const status = document.getElementById("admin-access-status");
+  status.className = "small mt-2 " + (type === "error" ? "text-danger" : type === "success" ? "text-success" : "text-muted");
+  status.textContent = message;
+}
+
+function updateAdminAccessCountdown() {
+  const requestButton = document.getElementById("admin-access-request-btn");
+  const state = document.getElementById("admin-access").dataset.state || "idle";
+  const expires = adminAccessSeconds(adminAccessExpiresAt);
+  const retry = adminAccessSeconds(adminAccessRetryAt);
+  requestButton.disabled = retry > 0 || ["pending", "queued", "delivered", "awaiting_code"].includes(state);
+  requestButton.textContent = retry > 0
+    ? `Espera ${retry}s para reenviar`
+    : "📨 Enviar código a Telegram";
+  if (["pending", "queued"].includes(state)) {
+    setAdminAccessStatus(
+      expires > 0
+        ? `Preparando el código para Telegram. Expira en ${expires}s.`
+        : "Preparando el código para Telegram…"
+    );
+  } else if (["delivered", "awaiting_code"].includes(state)) {
+    setAdminAccessStatus(
+      expires > 0
+        ? `Código enviado a Mensajes guardados. Expira en ${expires}s.`
+        : "Código enviado a Mensajes guardados."
+    );
+  }
+  if (adminAccessExpiresAt && expires === 0 && ["pending", "queued", "delivered", "awaiting_code"].includes(state)) {
+    document.getElementById("admin-access").dataset.state = "expired";
+    document.getElementById("admin-access-code-section").style.display = "none";
+    requestButton.disabled = retry > 0;
+    setAdminAccessStatus("El código venció. Solicita uno nuevo.", "error");
+    stopAdminAccessPolling();
+  }
+  if (!expires && !retry && adminAccessCountdownTimer) {
+    clearInterval(adminAccessCountdownTimer);
+    adminAccessCountdownTimer = null;
+  }
+}
+
+function startAdminAccessCountdown() {
+  if (!adminAccessCountdownTimer) {
+    adminAccessCountdownTimer = setInterval(updateAdminAccessCountdown, 1000);
+  }
+  updateAdminAccessCountdown();
+}
+
+function renderAdminAccessState(data) {
+  if (!data || typeof data !== "object") return;
+  if (data.csrf) channelCsrf = data.csrf;
+  const state = adminAccessState(data);
+  const panel = document.getElementById("admin-access");
+  const codeSection = document.getElementById("admin-access-code-section");
+  panel.dataset.state = state;
+  adminAccessExpiresAt = adminAccessDeadline(data, "expires_at", ["expires_in", "expires_seconds", "ttl"])
+    || adminAccessExpiresAt;
+  adminAccessRetryAt = adminAccessDeadline(data, "retry_at", ["retry_after"])
+    || adminAccessRetryAt;
+
+  if (["pending", "queued", "delivered", "awaiting_code"].includes(state)) {
+    codeSection.style.display = "block";
+    startAdminAccessCountdown();
+    if (["pending", "queued"].includes(state)) beginAdminAccessPolling();
+    else stopAdminAccessPolling();
+  } else if (state === "verified") {
+    adminAccessExpiresAt = 0;
+    codeSection.style.display = "none";
+    setAdminAccessStatus("Este navegador ya está verificado.", "success");
+    stopAdminAccessPolling();
+    loadChannelState(true);
+  } else if (state === "expired") {
+    adminAccessExpiresAt = 0;
+    codeSection.style.display = "none";
+    setAdminAccessStatus("El código venció. Solicita uno nuevo.", "error");
+    stopAdminAccessPolling();
+  } else if (state === "locked") {
+    adminAccessExpiresAt = 0;
+    codeSection.style.display = "none";
+    setAdminAccessStatus("Se agotaron los intentos. Espera antes de solicitar otro código.", "error");
+    stopAdminAccessPolling();
+  } else if (state === "delivery_failed") {
+    adminAccessExpiresAt = 0;
+    codeSection.style.display = "none";
+    setAdminAccessStatus("Telegram no pudo entregar el código. Reintenta cuando el servicio esté disponible.", "error");
+    stopAdminAccessPolling();
+  } else if (["cancelled", "canceled", "idle", "missing"].includes(state)) {
+    adminAccessExpiresAt = 0;
+    codeSection.style.display = "none";
+    setAdminAccessStatus(
+      ["cancelled", "canceled"].includes(state)
+        ? "Verificación cancelada."
+        : "Solicita un código para verificar este navegador. Telegram sigue conectado."
+    );
+    stopAdminAccessPolling();
+  }
+  startAdminAccessCountdown();
+}
+
+function stopAdminAccessPolling() {
+  adminAccessPolling = false;
+  if (adminAccessPollTimer) clearTimeout(adminAccessPollTimer);
+  adminAccessPollTimer = null;
+}
+
+function beginAdminAccessPolling() {
+  if (adminAccessPolling) return;
+  adminAccessPolling = true;
+  const poll = async () => {
+    if (!adminAccessPolling) return;
+    const data = await loadAdminAccessStatus();
+    const state = adminAccessState(data);
+    if (["pending", "queued"].includes(state)) {
+      adminAccessPollTimer = setTimeout(poll, 2000);
+    } else {
+      stopAdminAccessPolling();
+    }
+  };
+  adminAccessPollTimer = setTimeout(poll, 1000);
+}
+
+async function loadAdminAccessStatus() {
+  if (adminAccessStatusRequest) return adminAccessStatusRequest;
+  adminAccessStatusRequest = (async () => {
+    try {
+      const response = await fetch("/api/admin_access/status", {cache: "no-store"});
+      const data = await response.json();
+      renderAdminAccessState(data);
+      return data;
+    } catch(error) {
+      setAdminAccessStatus("No fue posible consultar la verificación. Intenta nuevamente.", "error");
+      return null;
+    } finally {
+      adminAccessStatusRequest = null;
+    }
+  })();
+  return adminAccessStatusRequest;
+}
+
+function openAdminAccessVerification() {
   document.getElementById("setup-modal").style.display = "block";
-  const status = document.getElementById("tg-link-status");
-  status.innerHTML = "🔐 Confirma el <strong>api_id, api_hash y teléfono actuales de Telegram</strong> para recuperar el acceso administrativo en este navegador.";
-  const form = document.getElementById("tg-initial-link");
-  form.style.display = "block";
+  const telegram = channelState && channelState.telegram ? channelState.telegram : {};
+  if (telegram.linked === false) {
+    document.getElementById("admin-access").style.display = "none";
+    document.getElementById("tg-credentials-help").style.display = "block";
+    document.getElementById("tg-initial-link").style.display = "block";
+    setTimeout(() => document.getElementById("tg-api-id").focus(), 0);
+    toast("Vincula Telegram antes de administrar WhatsApp.", "error");
+    return;
+  }
+  const panel = document.getElementById("admin-access");
+  document.getElementById("tg-credentials-help").style.display = "none";
+  document.getElementById("tg-initial-link").style.display = "none";
+  document.getElementById("tg-linked-actions").style.display = "none";
+  panel.style.display = "block";
+  if (!panel.dataset.state || panel.dataset.state === "idle") {
+    setAdminAccessStatus("Solicita un código para verificar este navegador. Telegram sigue conectado.");
+  }
   requestAnimationFrame(() => {
-    form.scrollIntoView({behavior: "smooth", block: "center"});
-    document.getElementById("tg-api-id").focus();
+    panel.scrollIntoView({behavior: "smooth", block: "center"});
+    document.getElementById("admin-access-request-btn").focus();
   });
-  toast("🔐 Recupera primero el acceso del panel con la cuenta actual de Telegram", "error");
+  loadAdminAccessStatus();
+  toast("Telegram sigue conectado. Verifica este navegador para administrar WhatsApp.", "error");
+}
+
+async function requestAdminAccess() {
+  const button = document.getElementById("admin-access-request-btn");
+  button.disabled = true;
+  setAdminAccessStatus("Solicitando un código de un solo uso…");
+  try {
+    const response = await fetch("/api/admin_access/request", {
+      method: "POST",
+      headers: channelHeaders(),
+      body: "{}"
+    });
+    const data = await response.json();
+    if (data.csrf) channelCsrf = data.csrf;
+    if (!response.ok || data.ok === false) {
+      renderAdminAccessState(data);
+      throw new Error(data.error || "No fue posible enviar el código");
+    }
+    if (data.authorized || adminAccessState(data) === "verified") {
+      channelCsrf = data.csrf || null;
+      await loadChannelState(true);
+      toast("✅ Este navegador ya está verificado", "success");
+      return;
+    }
+    const state = adminAccessState(data);
+    renderAdminAccessState(data);
+    if (!["pending", "queued", "delivered", "awaiting_code"].includes(state)) {
+      updateAdminAccessCountdown();
+      return;
+    }
+    document.getElementById("admin-access-code-section").style.display = "block";
+    document.getElementById("admin-access-code").value = "";
+    document.getElementById("admin-access-code").focus();
+    toast(
+      ["delivered", "awaiting_code"].includes(state)
+        ? "Código disponible en Mensajes guardados de Telegram."
+        : "Solicitud enviada. Espera la confirmación de entrega en Telegram.",
+      "success"
+    );
+  } catch(error) {
+    setAdminAccessStatus(error.message, "error");
+    updateAdminAccessCountdown();
+  }
+}
+
+async function verifyAdminAccess() {
+  const input = document.getElementById("admin-access-code");
+  const code = input.value.trim();
+  if (!/^\d{8}$/.test(code)) {
+    setAdminAccessStatus("Ingresa exactamente los 8 dígitos del código.", "error");
+    input.focus();
+    return;
+  }
+  const button = document.getElementById("admin-access-verify-btn");
+  button.disabled = true;
+  input.value = "";
+  setAdminAccessStatus("Verificando este navegador…");
+  try {
+    const response = await fetch("/api/admin_access/verify", {
+      method: "POST",
+      headers: channelHeaders(),
+      body: JSON.stringify({code})
+    });
+    const data = await response.json();
+    if (!response.ok || data.ok === false) {
+      renderAdminAccessState(data);
+      throw new Error(data.error || "El código no es válido");
+    }
+    stopAdminAccessPolling();
+    channelCsrf = data.csrf || null;
+    setAdminAccessStatus("Navegador verificado. Ya puedes administrar WhatsApp.", "success");
+    toast("✅ Navegador verificado", "success");
+    const latest = await loadChannelState(true);
+    if (latest && latest.csrf) channelCsrf = latest.csrf;
+    requestAnimationFrame(() => document.getElementById("wa-switch-btn").scrollIntoView({behavior: "smooth", block: "center"}));
+  } catch(error) {
+    button.disabled = false;
+    setAdminAccessStatus(error.message, "error");
+    input.focus();
+  }
+}
+
+async function cancelAdminAccess() {
+  stopAdminAccessPolling();
+  try {
+    const response = await fetch("/api/admin_access/cancel", {
+      method: "POST",
+      headers: channelHeaders(),
+      body: "{}"
+    });
+    const data = await response.json();
+    if (!response.ok && response.status !== 404) throw new Error(data.error || "No fue posible cancelar");
+    if (data.csrf) channelCsrf = data.csrf;
+    document.getElementById("admin-access").dataset.state = "cancelled";
+    adminAccessExpiresAt = 0;
+    adminAccessRetryAt = 0;
+    if (adminAccessCountdownTimer) clearInterval(adminAccessCountdownTimer);
+    adminAccessCountdownTimer = null;
+    document.getElementById("admin-access-code").value = "";
+    document.getElementById("admin-access-code-section").style.display = "none";
+    document.getElementById("admin-access-request-btn").disabled = false;
+    document.getElementById("admin-access-request-btn").textContent = "📨 Enviar código a Telegram";
+    setAdminAccessStatus("Verificación cancelada.");
+  } catch(error) {
+    setAdminAccessStatus(error.message, "error");
+  }
+  await loadChannelState(true);
 }
 
 function revealWaQrCard(resetImage=false) {
@@ -763,12 +1119,21 @@ function renderChannelState(data) {
   const tg = data.telegram || {};
   const tgInitial = document.getElementById("tg-initial-link");
   const tgLinked = document.getElementById("tg-linked-actions");
+  const tgCredentialsHelp = document.getElementById("tg-credentials-help");
+  const adminAccess = document.getElementById("admin-access");
   const tgSummary = document.getElementById("tg-account-summary");
   const tgSwitchOpen = document.getElementById("tg-switch-open-btn");
   tgSwitchOpen.disabled = !data.can_manage || tg.state === "recovery_required";
   if (tg.linked) {
-    tgInitial.style.display = data.can_manage ? "none" : "block";
+    tgCredentialsHelp.style.display = "none";
+    tgInitial.style.display = "none";
     tgLinked.style.display = data.can_manage ? "block" : "none";
+    adminAccess.style.display = data.can_manage ? "none" : "block";
+    if (data.can_manage) {
+      stopAdminAccessPolling();
+      document.getElementById("admin-access-code").value = "";
+      document.getElementById("admin-access-code-section").style.display = "none";
+    }
     tgSummary.textContent = "Cuenta actual: " + safeAccountLabel(tg, "Telegram vinculado");
     document.getElementById("tg-link-status").innerHTML = data.can_manage
       ? (tg.state === "recovery_required"
@@ -776,10 +1141,13 @@ function renderChannelState(data) {
           : tg.ready
           ? "✅ <strong>Vinculado y en línea.</strong>"
           : "⚠️ <strong>Cuenta vinculada, servicio fuera de línea.</strong>")
-      : "🔐 Para administrar desde este navegador, confirma abajo el api_id, api_hash y teléfono actuales.";
+      : "🔐 <strong>Telegram sigue conectado.</strong> Verifica este navegador con un código de un solo uso para administrar los canales.";
   } else {
+    tgCredentialsHelp.style.display = "block";
     tgInitial.style.display = "block";
     tgLinked.style.display = "none";
+    adminAccess.style.display = "none";
+    stopAdminAccessPolling();
     document.getElementById("tg-link-status").innerHTML =
       "⚠️ Sin vincular. Ingresa api_id, api_hash y teléfono una sola vez.";
   }
@@ -790,13 +1158,13 @@ function renderChannelState(data) {
   const restartWaButton = document.getElementById("restart-wa-btn");
   restartWaButton.disabled = wa.state === "recovery_required" || wa.state === "switching" || wa.state === "switching_elsewhere";
   restartWaButton.innerHTML = !data.can_manage
-    ? "🔐 Administrar WA"
+    ? "🔐 Verificar navegador"
     : wa.reauth_required
       ? "📲 Volver a vincular WA"
       : "🔄 Reiniciar servicio WA";
   waBtn.disabled = wa.state === "recovery_required" || wa.state === "switching";
   waBtn.innerHTML = !data.can_manage
-    ? "🔐 Recuperar acceso"
+    ? "🔐 Verificar navegador"
     : wa.state === "switching"
     ? "⏳ Cambio en curso…"
     : wa.state === "switching_elsewhere"
@@ -808,10 +1176,14 @@ function renderChannelState(data) {
     ? "Cuenta actual: " + safeAccountLabel(wa, "WhatsApp vinculado")
     : (data.can_manage
         ? "Todavía no hay una cuenta vinculada."
-        : "Vincula Telegram primero para habilitar la administración segura.");
+        : (tg.linked
+            ? "Telegram sigue conectado; verifica este navegador para administrar WhatsApp."
+            : "Vincula Telegram primero para habilitar la administración segura."));
   if (!data.can_manage) {
     document.getElementById("wa-link-status").innerHTML =
-      "🔐 Para administrar WhatsApp o generar un QR, pulsa <strong>Recuperar acceso</strong> y confirma arriba las credenciales actuales de Telegram.";
+      tg.linked
+        ? "🔐 Para administrar WhatsApp o generar un QR, pulsa <strong>Verificar navegador</strong>. Te enviaremos un código a Telegram."
+        : "🔐 Vincula Telegram primero para habilitar la administración segura.";
   } else if (wa.state === "recovery_required") {
     document.getElementById("wa-link-status").innerHTML =
       "❌ El cambio requiere recuperación manual. El respaldo se mantiene protegido.";
@@ -864,6 +1236,9 @@ async function showSetup() {
     document.getElementById("tg-2fa-section").style.display = 'none';
   }
   await loadChannelState();
+  if (channelState && channelState.telegram && channelState.telegram.linked && !channelState.can_manage) {
+    await loadAdminAccessStatus();
+  }
   if (tgAuthAttempt) {
     document.getElementById("tg-code-section").style.display = 'block';
     if (tgAuthMode === "switch") {
@@ -1023,7 +1398,7 @@ async function linkTelegram() {
     const payload = {api_id: parseInt(api_id), api_hash, phone, auth_attempt: tgAuthAttempt};
     const r = await fetch("/api/link_telegram", {
       method: "POST",
-      headers: {"Content-Type": "application/json"},
+      headers: channelHeaders(),
       body: JSON.stringify(payload)
     });
     const d = await r.json();
@@ -1049,27 +1424,23 @@ async function linkTelegram() {
       document.getElementById("tg-link-status").innerHTML = `📨 ${prefix} No solicites otro hasta que termine la espera.`;
       armTgRetry(d.retry_after ?? d.timeout_seconds ?? 30);
     } else if (d.ok) {
-      const recoveredAdmin = Boolean(d.already_authorized);
       clearTgAttempt();
       document.getElementById("tg-api-hash").value = '';
-      toast(
-        recoveredAdmin
-          ? "✅ Acceso administrativo recuperado"
-          : "✅ Vinculado. El bot se conectará como usuario.",
-        "success"
-      );
-      document.getElementById("tg-link-status").innerHTML = recoveredAdmin
-        ? '✅ <strong>Acceso recuperado. Ya puedes volver a vincular WhatsApp.</strong>'
-        : '✅ <strong>Sesión autorizada; iniciando Telegram…</strong>';
+      toast("✅ Vinculado. El bot se conectará como usuario.", "success");
+      document.getElementById("tg-link-status").innerHTML =
+        '✅ <strong>Sesión autorizada; iniciando Telegram…</strong>';
       await loadChannelState(true);
-      if (recoveredAdmin) {
-        requestAnimationFrame(() => document.getElementById("wa-switch-btn").scrollIntoView({behavior: "smooth", block: "center"}));
-      } else {
-        setTimeout(() => document.getElementById("setup-modal").style.display = 'none', 1500);
-      }
+      setTimeout(() => document.getElementById("setup-modal").style.display = 'none', 1500);
       btn.disabled = false;
       btn.innerHTML = '🔗 Vincular';
     } else {
+      if (d.error_code === "admin_verification_required") {
+        btn.disabled = false;
+        btn.innerHTML = '🔗 Vincular';
+        await loadChannelState(true);
+        openAdminAccessVerification();
+        return;
+      }
       toast("❌ " + (d.error || "Error"), "error");
       document.getElementById("tg-link-status").innerHTML = '❌ ' + (d.error || "Error");
       if (d.retry_after) armTgRetry(d.retry_after);
@@ -1095,7 +1466,7 @@ async function verifyTgCode() {
     const switching = tgAuthMode === "switch";
     const r = await fetch(switching ? "/api/switch_telegram/code" : "/api/verify_telegram_code", {
       method: "POST",
-      headers: switching ? channelHeaders() : {"Content-Type": "application/json"},
+      headers: channelHeaders(),
       body: JSON.stringify({code, auth_attempt: tgAuthAttempt})
     });
     const d = await r.json();
@@ -1134,7 +1505,7 @@ async function verifyTgPassword() {
     const switching = tgAuthMode === "switch";
     const r = await fetch(switching ? "/api/switch_telegram/password" : "/api/verify_telegram_password", {
       method: "POST",
-      headers: switching ? channelHeaders() : {"Content-Type": "application/json"},
+      headers: channelHeaders(),
       body: JSON.stringify({password, auth_attempt: tgAuthAttempt})
     });
     const d = await r.json();
@@ -1163,7 +1534,7 @@ async function cancelTgAuth() {
   const switching = tgAuthMode === "switch";
   await fetch(switching ? "/api/switch_telegram/cancel" : "/api/cancel_telegram_auth", {
     method: "POST",
-    headers: switching ? channelHeaders() : {"Content-Type": "application/json"},
+    headers: channelHeaders(),
     body: JSON.stringify({auth_attempt: tgAuthAttempt})
   }).catch(() => {});
   clearTgAttempt();
@@ -1181,6 +1552,7 @@ async function cancelTgAuth() {
 }
 
 async function linkBotFather() {
+  if (!requirePanelAdmin()) return;
   const token = document.getElementById("bf-token-input").value.trim();
   if (!token) { toast("❌ Pega el token primero", "error"); return; }
   if (!token.includes(":")) { toast("❌ Token inválido", "error"); return; }
@@ -1191,11 +1563,16 @@ async function linkBotFather() {
   try {
     const r = await fetch("/api/link_botfather", {
       method: "POST",
-      headers: {"Content-Type": "application/json"},
+      headers: channelHeaders(),
       body: JSON.stringify({token})
     });
     const d = await r.json();
     if (d.ok) {
+      await fetch("/api/start_botfather", {
+        method: "POST",
+        headers: channelHeaders(),
+        body: "{}"
+      });
       toast("✅ BotFather vinculado como @" + d.bot_name, "success");
       el.innerHTML = '✅ <strong>Vinculado</strong> como @' + d.bot_name;
     } else {
@@ -1239,7 +1616,7 @@ async function startWaSwitch(knownState=null) {
     return;
   }
   if (!latest.can_manage) {
-    guideChannelAdminRecovery();
+    openAdminAccessVerification();
     return;
   }
   const current = latest.whatsapp || {};
@@ -1434,6 +1811,10 @@ async function cancelWaSwitch() {
   await loadChannelState();
 }
 
+document.getElementById("admin-access-code").addEventListener("input", event => {
+  event.target.value = event.target.value.replace(/\D/g, "").slice(0, 8);
+});
+
 // Auto-refresh cada 10 segundos
 loadData();
 loadChannelState();
@@ -1442,8 +1823,6 @@ setInterval(loadChannelState, 10000);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") loadChannelState();
 });
-// Auto-iniciar BotFather si hay token configurado
-fetch("/api/start_botfather", {method:"POST"}).catch(()=>{});
 </script>
 </body>
 </html>"""
@@ -1547,17 +1926,33 @@ def _channel_csrf_token() -> str:
     return token
 
 
+def _admin_access_browser_token(*, create: bool = False) -> str | None:
+    """Identificador opaco que liga un reto al navegador que lo solicitó."""
+
+    token = session.get("admin_access_browser")
+    if isinstance(token, str) and len(token) >= 32:
+        return token
+    if not create:
+        return None
+    token = secrets.token_urlsafe(32)
+    session["admin_access_browser"] = token
+    session.permanent = True
+    return token
+
+
 def _can_manage_channels() -> bool:
-    return bool(session.get("telegram_admin") or session.get("wa_admin"))
+    if session.get("channel_admin"):
+        return True
+    # Migra una sesión administrativa legítima creada por una versión anterior.
+    if session.get("telegram_admin") or session.get("wa_admin"):
+        session["channel_admin"] = True
+        session.pop("telegram_admin", None)
+        session.pop("wa_admin", None)
+        return True
+    return False
 
 
-def _channel_mutation_error():
-    if not _can_manage_channels():
-        return jsonify({
-            "ok": False,
-            "error_code": "admin_required",
-            "error": "Abre el panel desde el navegador que vinculó los canales.",
-        }), 403
+def _channel_csrf_error():
     supplied = request.headers.get("X-Channel-CSRF", "")
     expected = _channel_csrf_token()
     if not supplied or not secrets.compare_digest(supplied, expected):
@@ -1567,6 +1962,45 @@ def _channel_mutation_error():
             "error": "La sesión del panel cambió. Recarga la página e intenta nuevamente.",
         }), 403
     return None
+
+
+def _channel_mutation_error():
+    if not _can_manage_channels():
+        return jsonify({
+            "ok": False,
+            "error_code": "admin_required",
+            "error": "Abre el panel desde el navegador que vinculó los canales.",
+        }), 403
+    return _channel_csrf_error()
+
+
+_PANEL_CSRF_ONLY_MUTATIONS = frozenset({
+    "/api/admin_access/request",
+    "/api/admin_access/verify",
+    "/api/admin_access/cancel",
+    "/api/link_telegram",
+    "/api/verify_telegram_code",
+    "/api/verify_telegram_password",
+    "/api/cancel_telegram_auth",
+})
+
+
+@app.before_request
+def _protect_panel_api_mutations():
+    """Protección central y fail-closed para toda mutación actual o futura."""
+
+    if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return None
+    if not request.path.startswith("/api/"):
+        return None
+    # Endpoint histórico deliberadamente inerte: siempre responde 410 y nunca
+    # toca la sesión. Se conserva sin auth para que clientes antiguos fallen de
+    # forma explícita en lugar de interpretar un 403 como un problema de acceso.
+    if request.path == "/api/reset_wa":
+        return None
+    if request.path in _PANEL_CSRF_ONLY_MUTATIONS:
+        return _channel_csrf_error()
+    return _channel_mutation_error()
 
 
 def _normalize_telegram_phone(phone: str) -> str | None:
@@ -1586,18 +2020,6 @@ def _valid_telegram_credentials(api_id, api_hash: str, phone: str) -> bool:
         valid_id
         and re.fullmatch(r"[0-9a-fA-F]{32}", api_hash or "")
         and re.fullmatch(r"\+[0-9]{7,15}", phone or "")
-    )
-
-
-def _telegram_credentials_match_saved(api_id, api_hash: str, phone: str) -> bool:
-    """Permite recuperar el navegador administrador con las credenciales TG."""
-    saved_id = os.environ.get("TG_API_ID") or _read_env_var("TG_API_ID") or ""
-    saved_hash = os.environ.get("TG_API_HASH") or _read_env_var("TG_API_HASH") or ""
-    saved_phone = os.environ.get("TG_PHONE") or _read_env_var("TG_PHONE") or ""
-    return (
-        secrets.compare_digest(str(api_id), str(saved_id))
-        and secrets.compare_digest(api_hash, saved_hash)
-        and secrets.compare_digest(phone, saved_phone)
     )
 
 
@@ -2590,6 +3012,100 @@ def api_tg_status():
     })
 
 
+def _admin_access_response_status(result: dict) -> int:
+    error_code = result.get("error_code")
+    return {
+        "invalid_browser_token": 400,
+        "invalid_code": 400,
+        "not_delivered": 409,
+        "request_in_progress": 409,
+        "no_active_challenge": 404,
+        "expired_code": 410,
+        "attempts_exhausted": 429,
+        "rate_limited": 429,
+        "busy": 503,
+        "storage_error": 503,
+        "delivery_failed": 503,
+    }.get(error_code, 200 if result.get("ok") else 400)
+
+
+@app.route("/api/admin_access/request", methods=["POST"])
+def api_admin_access_request():
+    """Envía un OTP por la cuenta TG ya activa, sin pedir credenciales MTProto."""
+
+    csrf_error = _channel_csrf_error()
+    if csrf_error:
+        return csrf_error
+    if _can_manage_channels():
+        return jsonify({
+            "ok": True,
+            "authorized": True,
+            "state": "verified",
+            "csrf": _channel_csrf_token(),
+        })
+    if not _telegram_session_is_authorized():
+        return jsonify({
+            "ok": False,
+            "error_code": "telegram_not_linked",
+            "error": "Telegram todavía no está vinculado.",
+        }), 409
+
+    if not bot_is_running():
+        return jsonify({
+            "ok": False,
+            "error_code": "telegram_offline",
+            "error": "Telegram está vinculado, pero el servicio de entrega está fuera de línea.",
+        }), 503
+
+    browser_token = _admin_access_browser_token(create=True)
+    result = _panel_admin_access.create_challenge(browser_token)
+    return jsonify(result), _admin_access_response_status(result)
+
+
+@app.route("/api/admin_access/status")
+def api_admin_access_status():
+    if _can_manage_channels():
+        return jsonify({
+            "ok": True,
+            "authorized": True,
+            "state": "verified",
+            "csrf": _channel_csrf_token(),
+        })
+    browser_token = _admin_access_browser_token()
+    result = _panel_admin_access.get_status(browser_token or "")
+    return jsonify(result), _admin_access_response_status(result)
+
+
+@app.route("/api/admin_access/verify", methods=["POST"])
+def api_admin_access_verify():
+    csrf_error = _channel_csrf_error()
+    if csrf_error:
+        return csrf_error
+    data = request.get_json(silent=True) or {}
+    code = data.get("code") if isinstance(data.get("code"), str) else ""
+    browser_token = _admin_access_browser_token()
+    result = _panel_admin_access.verify(browser_token or "", code.strip())
+    if result.get("authorized"):
+        session["channel_admin"] = True
+        session.pop("telegram_admin", None)
+        session.pop("wa_admin", None)
+        session["admin_access_browser"] = secrets.token_urlsafe(32)
+        session["channel_csrf"] = secrets.token_urlsafe(32)
+        session.permanent = True
+        result["csrf"] = session["channel_csrf"]
+    return jsonify(result), _admin_access_response_status(result)
+
+
+@app.route("/api/admin_access/cancel", methods=["POST"])
+def api_admin_access_cancel():
+    csrf_error = _channel_csrf_error()
+    if csrf_error:
+        return csrf_error
+    browser_token = _admin_access_browser_token()
+    result = _panel_admin_access.cancel(browser_token or "")
+    return jsonify(result), _admin_access_response_status(result)
+
+
 def _finish_telegram_auth(outcome):
     """Persiste sólo credenciales verificadas e inicia el worker."""
     public = dict(outcome.public)
@@ -2605,7 +3121,7 @@ def _finish_telegram_auth(outcome):
         "TG_API_HASH": api_hash,
         "TG_PHONE": phone,
     })
-    session["telegram_admin"] = True
+    session["channel_admin"] = True
     session.permanent = True
     started, message = restart_telegram_worker()
     public.update({
@@ -2639,7 +3155,7 @@ def _finish_telegram_switch(outcome):
         "message": message,
     })
     if switched:
-        session["telegram_admin"] = True
+        session["channel_admin"] = True
         session.permanent = True
     else:
         public.update({
@@ -2654,6 +3170,22 @@ def _finish_telegram_switch(outcome):
 @app.route("/api/link_telegram", methods=["POST"])
 def api_link_telegram():
     """Inicia una autorización y describe el canal elegido por Telegram."""
+    # Las credenciales MTProto identifican una aplicación; nunca se usan como
+    # contraseña del panel. Una cuenta ya vinculada se administra mediante el
+    # código temporal enviado por su propia sesión activa.
+    if _telegram_session_is_authorized():
+        if not _can_manage_channels():
+            return jsonify({
+                "ok": False,
+                "error_code": "admin_verification_required",
+                "error": "Telegram ya está vinculado. Verifica este navegador con el código enviado a Telegram.",
+            }), 409
+        return jsonify({
+            "ok": False,
+            "error_code": "already_linked",
+            "error": "Telegram ya está vinculado. Usa Cambiar cuenta si deseas reemplazarlo.",
+        }), 409
+
     data = request.get_json(silent=True) or {}
     api_id = data.get("api_id")
     api_hash = (data.get("api_hash") or "").strip()
@@ -2665,29 +3197,6 @@ def api_link_telegram():
             "error_code": "invalid_input",
             "error": "Revisa api_id, api_hash y el teléfono en formato internacional.",
         }), 400
-
-    # Una sesión autorizada no puede sobrescribirse desde el panel público.
-    if _telegram_session_is_authorized():
-        if not session.get("telegram_admin"):
-            if not _telegram_credentials_match_saved(api_id, api_hash, phone):
-                return jsonify({
-                    "ok": False,
-                    "error_code": "already_linked",
-                    "error": "Telegram ya está vinculado y las credenciales no coinciden.",
-                }), 403
-            session["telegram_admin"] = True
-            session.permanent = True
-        if bot_is_running():
-            started, message = True, "Acceso administrativo recuperado; Telegram sigue en línea."
-        else:
-            started, message = restart_telegram_worker()
-        return jsonify({
-            "ok": started,
-            "already_authorized": True,
-            "worker_starting": started,
-            "message": message,
-            **({} if started else {"error": message}),
-        })
 
     outcome = _telegram_auth.begin(
         int(api_id), api_hash, phone, data.get("auth_attempt")
@@ -3260,7 +3769,7 @@ def _promote_wa_candidate() -> tuple[bool, str, dict, bool, bool]:
         rollback_state.unlink(missing_ok=True)
         rollback_identity.unlink(missing_ok=True)
         _cleanup_wa_switch_candidate()
-        session["wa_admin"] = True
+        session["channel_admin"] = True
         session.permanent = True
         return True, "Cuenta de WhatsApp cambiada y verificada.", candidate_identity, True, True
 

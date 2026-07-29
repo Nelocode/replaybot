@@ -26,6 +26,7 @@ from telethon.tl import types
 
 from interaction_state import PersistentInteractionState
 from message_schema import load_message_file
+from panel_admin_access import deliver_pending_challenge
 from telegram_audio_branding import (
     brand_audio_attributes,
     build_branded_audio_media,
@@ -61,11 +62,13 @@ IDENTITY_FILE = DATA_DIR / "tg_identity.json"
 AUTHORIZED_MARKER_FILE = DATA_DIR / "tg_session_authorized.json"
 INTERACTION_STATE_FILE = DATA_DIR / "tg_interaction_state.json"
 INTERACTION_HEALTH_FILE = DATA_DIR / "tg_interaction_health.json"
+PANEL_ADMIN_ACCESS_DIR = DATA_DIR / "panel_admin_access"
 TELEGRAM_SEND_TIMEOUT_SECONDS = 20
 TELEGRAM_SEND_RETRIES = 3
 TELEGRAM_CALL_REJECT_TIMEOUT_SECONDS = 6
 TELEGRAM_CALL_REJECT_SETTLE_SECONDS = 0.5
 RECENT_CALL_REJECTION_LIMIT = 256
+PANEL_ADMIN_ACCESS_POLL_SECONDS = 1.0
 
 
 def _load_env_file() -> None:
@@ -635,6 +638,27 @@ async def poll_recent_missed_calls() -> None:
         await asyncio.sleep(12)
 
 
+async def poll_panel_admin_access() -> None:
+    """Entrega códigos del panel usando exclusivamente esta sesión viva."""
+
+    while True:
+        try:
+            result = await deliver_pending_challenge(client, PANEL_ADMIN_ACCESS_DIR)
+            state = result.get("state")
+            if state == "sent" and not result.get("already_delivered"):
+                logging.info("Panel access code delivered to Telegram Saved Messages.")
+            elif state == "delivery_failed" and not result.get("already_failed"):
+                logging.warning("Panel access code delivery exhausted its safe retries.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logging.warning(
+                "Panel access delivery check failed (%s)",
+                type(exc).__name__,
+            )
+        await asyncio.sleep(PANEL_ADMIN_ACCESS_POLL_SECONDS)
+
+
 async def main() -> None:
     global self_user_id
     logging.basicConfig(
@@ -663,14 +687,20 @@ async def main() -> None:
             write_health(True)
             heartbeat_task = asyncio.create_task(heartbeat())
             missed_call_task = asyncio.create_task(poll_recent_missed_calls())
+            panel_access_task = asyncio.create_task(poll_panel_admin_access())
             try:
                 await client.run_until_disconnected()
             finally:
                 update_interaction_health(connection="closed")
                 heartbeat_task.cancel()
                 missed_call_task.cancel()
+                panel_access_task.cancel()
                 try:
-                    await asyncio.gather(heartbeat_task, missed_call_task)
+                    await asyncio.gather(
+                        heartbeat_task,
+                        missed_call_task,
+                        panel_access_task,
+                    )
                 except asyncio.CancelledError:
                     pass
                 try:
