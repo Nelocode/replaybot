@@ -403,6 +403,14 @@ function shutdown(signal) {
   process.exit(0);
 }
 
+process.on('unhandledRejection', (reason) => {
+  console.error('[WA] Unhandled Rejection:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('[WA] Uncaught Exception:', error);
+});
+
 process.once('SIGINT', () => shutdown('SIGINT'));
 process.once('SIGTERM', () => shutdown('SIGTERM'));
 
@@ -410,3 +418,4 @@ startBot().catch(() => {
   console.error('[WA] Initial connection setup failed');
   scheduleReconnect();
 });
+

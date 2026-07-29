@@ -228,16 +228,22 @@ def main():
         logging.warning("No AUTOREPLY_BOT_TOKEN — BotFather bot exiting.")
         return
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    while True:
+        try:
+            app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.VOICE | filters.VIDEO_NOTE, handle_call))
-    app.add_error_handler(error_handler)
+            app.add_handler(CommandHandler("start", start))
+            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+            app.add_handler(MessageHandler(filters.VOICE | filters.VIDEO_NOTE, handle_call))
+            app.add_error_handler(error_handler)
 
-    logging.info("BotFather bot starting... (token=%s...)", BOT_TOKEN[:8])
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+            logging.info("BotFather bot starting... (token=%s...)", BOT_TOKEN[:8])
+            app.run_polling(allowed_updates=Update.ALL_TYPES)
+        except Exception as e:
+            logging.error("[BF] BotFather bot crashed: %s. Restarting in 5s...", e)
+            time.sleep(5)
 
 
 if __name__ == "__main__":
     main()
+

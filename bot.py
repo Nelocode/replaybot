@@ -642,40 +642,49 @@ async def main() -> None:
         level=logging.INFO,
     )
 
-    logging.info("Starting Telegram User Bot...")
-    update_interaction_health(connection="connecting")
-    await client.connect()
-    if not await client.is_user_authorized():
-        AUTHORIZED_MARKER_FILE.unlink(missing_ok=True)
-        raise RuntimeError(
-            "La sesión de Telegram no está autorizada; completa la vinculación en el panel."
-        )
+    while True:
+        try:
+            logging.info("Starting Telegram User Bot...")
+            update_interaction_health(connection="connecting")
+            await client.connect()
+            if not await client.is_user_authorized():
+                AUTHORIZED_MARKER_FILE.unlink(missing_ok=True)
+                logging.error(
+                    "La sesión de Telegram no está autorizada; completa la vinculación en el panel."
+                )
+                break
 
-    me = await client.get_me()
-    self_user_id = me.id
-    write_authorized_marker()
-    write_identity(me)
-    logging.info("Telegram session authorized; user bot ready.")
-    await client.catch_up()
-    write_health(True)
-    heartbeat_task = asyncio.create_task(heartbeat())
-    missed_call_task = asyncio.create_task(poll_recent_missed_calls())
-    try:
-        await client.run_until_disconnected()
-    finally:
-        update_interaction_health(connection="closed")
-        heartbeat_task.cancel()
-        missed_call_task.cancel()
-        try:
-            await asyncio.gather(heartbeat_task, missed_call_task)
+            me = await client.get_me()
+            self_user_id = me.id
+            write_authorized_marker()
+            write_identity(me)
+            logging.info("Telegram session authorized; user bot ready.")
+            await client.catch_up()
+            write_health(True)
+            heartbeat_task = asyncio.create_task(heartbeat())
+            missed_call_task = asyncio.create_task(poll_recent_missed_calls())
+            try:
+                await client.run_until_disconnected()
+            finally:
+                update_interaction_health(connection="closed")
+                heartbeat_task.cancel()
+                missed_call_task.cancel()
+                try:
+                    await asyncio.gather(heartbeat_task, missed_call_task)
+                except asyncio.CancelledError:
+                    pass
+                try:
+                    HEALTH_FILE.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                await client.disconnect()
         except asyncio.CancelledError:
-            pass
-        try:
-            HEALTH_FILE.unlink(missing_ok=True)
-        except OSError:
-            pass
-        await client.disconnect()
+            break
+        except Exception as exc:
+            logging.warning("Telegram UserBot disconnected or encountered error (%s: %s). Reconnecting in 5s...", type(exc).__name__, exc)
+            await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+

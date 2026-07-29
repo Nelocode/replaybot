@@ -3330,6 +3330,10 @@ def api_switch_wa():
     with _wa_switch_lock:
         _reap_expired_wa_switch()
         existing = _load_wa_switch_operation()
+        if existing and not _wa_process_running(WA_SWITCH_PID_FILE):
+            _cleanup_wa_switch_candidate()
+            existing = None
+
         if _whatsapp_recovery_pending() or (
             existing and existing.get("status") == "recovery_required"
         ):
@@ -3357,9 +3361,9 @@ def api_switch_wa():
                         else "Ya hay una vinculación de WhatsApp abierta en otro navegador."
                     ),
                 }), 409
-            # Un worker candidato muerto no debe bloquear un QR nuevo hasta
-            # que venza el TTL. La limpieza siguiente sólo toca el staging.
         _cleanup_wa_switch_candidate()
+
+
         _secure_directory(WA_SWITCH_AUTH_DIR)
         token = secrets.token_urlsafe(32)
         operation = {
@@ -3658,6 +3662,48 @@ def api_start_botfather():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+_supervisor_thread_started = False
+_supervisor_lock = threading.Lock()
+
+def _background_service_supervisor():
+    """Supervisa de forma continua los procesos de fondo en producción.
+    Si algún servicio cae pero la sesión sigue activa, lo reinicia automáticamente."""
+    time.sleep(10)
+    while True:
+        try:
+            with _wa_switch_lock:
+                wa_auth_present = WA_AUTH_DIR.exists() and any(WA_AUTH_DIR.iterdir())
+                wa_switching = bool(_load_wa_switch_operation())
+                if wa_auth_present and not wa_switching and not _wa_process_running(DATA_DIR / "wa_bot.pid"):
+                    health = _read_wa_call_health()
+                    if not health.get("reauth_required"):
+                        print("[Supervisor] WhatsApp no está corriendo pero hay sesión. Reiniciando servicio...")
+                        restart_wa_bot()
+
+            if _telegram_session_is_authorized() and not bot_is_running() and not _telegram_switch_auth.has_pending():
+                print("[Supervisor] Telegram UserBot no está corriendo pero está autorizado. Reiniciando servicio...")
+                restart_telegram_worker()
+
+            token = os.environ.get("AUTOREPLY_BOT_TOKEN") or _read_env_var("AUTOREPLY_BOT_TOKEN")
+            if token and not bf_is_running():
+                print("[Supervisor] BotFather bot no está corriendo pero hay token. Reiniciando servicio...")
+                api_start_botfather()
+        except Exception as e:
+            pass
+
+        time.sleep(20)
+
+def _ensure_supervisor_running():
+    global _supervisor_thread_started
+    with _supervisor_lock:
+        if not _supervisor_thread_started:
+            _supervisor_thread_started = True
+            t = threading.Thread(target=_background_service_supervisor, daemon=True)
+            t.start()
+
+_ensure_supervisor_running()
+
+
 # ── Main ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
@@ -3671,3 +3717,4 @@ if __name__ == "__main__":
     print(f"   Y usa gunicorn o espera a que te ayude a configurarlo.")
 
     app.run(host=host, port=port, debug=debug)
+
