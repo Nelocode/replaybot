@@ -805,7 +805,7 @@ async function saveCallText(lang, text) {
 async function restartBot() {
   const latest = await loadChannelState();
   if (!latest || !latest.can_manage) {
-    openAdminAccessVerification();
+    guideChannelAdminRecovery();
     return;
   }
   if (!confirm("¿Reiniciar el bot de Telegram? (toma efecto inmediato)")) return;
@@ -849,7 +849,7 @@ async function restartWaBot() {
     return;
   }
   if (!latest.can_manage) {
-    openAdminAccessVerification();
+    guideChannelAdminRecovery();
     return;
   }
   if (latest.whatsapp && latest.whatsapp.reauth_required) {
@@ -954,7 +954,7 @@ function channelUploadHeaders() {
 
 function requirePanelAdmin() {
   if (channelState && channelState.can_manage) return true;
-  openAdminAccessVerification();
+  guideChannelAdminRecovery();
   return false;
 }
 
@@ -964,6 +964,23 @@ function safeAccountLabel(account, fallback) {
   if (account && account.username) parts.push("@" + account.username);
   if (account && account.phone_hint) parts.push(account.phone_hint);
   return parts.length ? parts.join(" · ") : fallback;
+}
+
+function guideChannelAdminRecovery() {
+  document.getElementById("setup-modal").style.display = "block";
+  document.getElementById("admin-access").style.display = "none";
+  document.getElementById("tg-credentials-help").style.display = "block";
+  const status = document.getElementById("tg-link-status");
+  status.innerHTML = "🔐 Confirma el <strong>api_id, api_hash y teléfono actuales de Telegram</strong> para recuperar el acceso administrativo en este navegador.";
+  const form = document.getElementById("tg-initial-link");
+  form.style.display = "block";
+  const button = document.getElementById("tg-link-btn");
+  button.innerHTML = "🔐 Recuperar acceso";
+  requestAnimationFrame(() => {
+    form.scrollIntoView({behavior: "smooth", block: "center"});
+    document.getElementById("tg-api-id").focus();
+  });
+  toast("🔐 Recupera primero el acceso del panel con la cuenta actual de Telegram", "error");
 }
 
 function adminAccessState(data) {
@@ -1327,17 +1344,17 @@ function renderChannelState(data) {
   const adminAccess = document.getElementById("admin-access");
   const tgSummary = document.getElementById("tg-account-summary");
   const tgSwitchOpen = document.getElementById("tg-switch-open-btn");
+  const tgLinkButton = document.getElementById("tg-link-btn");
   tgSwitchOpen.disabled = !data.can_manage || tg.state === "recovery_required";
   if (tg.linked) {
-    tgCredentialsHelp.style.display = "none";
-    tgInitial.style.display = "none";
+    tgCredentialsHelp.style.display = data.can_manage ? "none" : "block";
+    tgInitial.style.display = data.can_manage ? "none" : "block";
     tgLinked.style.display = data.can_manage ? "block" : "none";
-    adminAccess.style.display = data.can_manage ? "none" : "block";
-    if (data.can_manage) {
-      stopAdminAccessPolling();
-      document.getElementById("admin-access-code").value = "";
-      document.getElementById("admin-access-code-section").style.display = "none";
-    }
+    adminAccess.style.display = "none";
+    stopAdminAccessPolling();
+    document.getElementById("admin-access-code").value = "";
+    document.getElementById("admin-access-code-section").style.display = "none";
+    tgLinkButton.innerHTML = data.can_manage ? "🔗 Vincular" : "🔐 Recuperar acceso";
     tgSummary.textContent = "Cuenta actual: " + safeAccountLabel(tg, "Telegram vinculado");
     document.getElementById("tg-link-status").innerHTML = data.can_manage
       ? (tg.state === "recovery_required"
@@ -1345,13 +1362,14 @@ function renderChannelState(data) {
           : tg.ready
           ? "✅ <strong>Vinculado y en línea.</strong>"
           : "⚠️ <strong>Cuenta vinculada, servicio fuera de línea.</strong>")
-      : "🔐 <strong>Telegram sigue conectado.</strong> Verifica este navegador con un código de un solo uso para administrar los canales.";
+      : "🔐 Para administrar desde este navegador, confirma abajo el api_id, api_hash y teléfono actuales.";
   } else {
     tgCredentialsHelp.style.display = "block";
     tgInitial.style.display = "block";
     tgLinked.style.display = "none";
     adminAccess.style.display = "none";
     stopAdminAccessPolling();
+    tgLinkButton.innerHTML = "🔗 Vincular";
     document.getElementById("tg-link-status").innerHTML =
       "⚠️ Sin vincular. Ingresa api_id, api_hash y teléfono una sola vez.";
   }
@@ -1362,13 +1380,13 @@ function renderChannelState(data) {
   const restartWaButton = document.getElementById("restart-wa-btn");
   restartWaButton.disabled = wa.state === "recovery_required" || wa.state === "switching" || wa.state === "switching_elsewhere";
   restartWaButton.innerHTML = !data.can_manage
-    ? "🔐 Verificar navegador"
+    ? "🔐 Administrar WA"
     : wa.reauth_required
       ? "📲 Volver a vincular WA"
       : "🔄 Reiniciar servicio WA";
   waBtn.disabled = wa.state === "recovery_required" || wa.state === "switching";
   waBtn.innerHTML = !data.can_manage
-    ? "🔐 Verificar navegador"
+    ? "🔐 Recuperar acceso"
     : wa.state === "switching"
     ? "⏳ Cambio en curso…"
     : wa.state === "switching_elsewhere"
@@ -1380,14 +1398,10 @@ function renderChannelState(data) {
     ? "Cuenta actual: " + safeAccountLabel(wa, "WhatsApp vinculado")
     : (data.can_manage
         ? "Todavía no hay una cuenta vinculada."
-        : (tg.linked
-            ? "Telegram sigue conectado; verifica este navegador para administrar WhatsApp."
-            : "Vincula Telegram primero para habilitar la administración segura."));
+        : "Vincula Telegram primero para habilitar la administración segura.");
   if (!data.can_manage) {
     document.getElementById("wa-link-status").innerHTML =
-      tg.linked
-        ? "🔐 Para administrar WhatsApp o generar un QR, pulsa <strong>Verificar navegador</strong>. Te enviaremos un código a Telegram."
-        : "🔐 Vincula Telegram primero para habilitar la administración segura.";
+      "🔐 Para administrar WhatsApp o generar un QR, pulsa <strong>Recuperar acceso</strong> y confirma arriba las credenciales actuales de Telegram.";
   } else if (wa.state === "recovery_required") {
     document.getElementById("wa-link-status").innerHTML =
       "❌ El cambio requiere recuperación manual. El respaldo se mantiene protegido.";
@@ -1452,9 +1466,6 @@ async function showSetup() {
     document.getElementById("tg-2fa-section").style.display = 'none';
   }
   await loadChannelState();
-  if (channelState && channelState.telegram && channelState.telegram.linked && !channelState.can_manage) {
-    await loadAdminAccessStatus();
-  }
   if (tgAuthAttempt) {
     document.getElementById("tg-code-section").style.display = 'block';
     if (tgAuthMode === "switch") {
@@ -1597,6 +1608,9 @@ async function startTelegramSwitch() {
 
 async function linkTelegram() {
   rememberTgAttempt("link", tgAuthAttempt);
+  const recoveringAdmin = Boolean(
+    channelState && channelState.telegram && channelState.telegram.linked && !channelState.can_manage
+  );
   const api_id = document.getElementById("tg-api-id").value.trim();
   const api_hash = document.getElementById("tg-api-hash").value.trim();
   const phone = document.getElementById("tg-phone").value.trim();
@@ -1608,7 +1622,9 @@ async function linkTelegram() {
   const btn = document.getElementById("tg-link-btn");
   btn.disabled = true;
   btn.innerHTML = '⏳ Conectando...';
-  document.getElementById("tg-link-status").innerHTML = '🔄 Solicitando código a Telegram...';
+  document.getElementById("tg-link-status").innerHTML = recoveringAdmin
+    ? '🔄 Comprobando la cuenta actual de Telegram...'
+    : '🔄 Solicitando código a Telegram...';
 
   try {
     const payload = {api_id: parseInt(api_id), api_hash, phone, auth_attempt: tgAuthAttempt};
@@ -1640,23 +1656,28 @@ async function linkTelegram() {
       document.getElementById("tg-link-status").innerHTML = `📨 ${prefix} No solicites otro hasta que termine la espera.`;
       armTgRetry(d.retry_after ?? d.timeout_seconds ?? 30);
     } else if (d.ok) {
+      const recoveredAdmin = Boolean(d.already_authorized);
+      if (d.csrf) channelCsrf = d.csrf;
       clearTgAttempt();
       document.getElementById("tg-api-hash").value = '';
-      toast("✅ Vinculado. El bot se conectará como usuario.", "success");
-      document.getElementById("tg-link-status").innerHTML =
-        '✅ <strong>Sesión autorizada; iniciando Telegram…</strong>';
+      toast(
+        recoveredAdmin
+          ? "✅ Acceso administrativo recuperado"
+          : "✅ Vinculado. El bot se conectará como usuario.",
+        "success"
+      );
+      document.getElementById("tg-link-status").innerHTML = recoveredAdmin
+        ? '✅ <strong>Acceso recuperado. Ya puedes administrar WhatsApp.</strong>'
+        : '✅ <strong>Sesión autorizada; iniciando Telegram…</strong>';
       await loadChannelState(true);
-      setTimeout(() => document.getElementById("setup-modal").style.display = 'none', 1500);
+      if (recoveredAdmin) {
+        requestAnimationFrame(() => document.getElementById("wa-switch-btn").scrollIntoView({behavior: "smooth", block: "center"}));
+      } else {
+        setTimeout(() => document.getElementById("setup-modal").style.display = 'none', 1500);
+      }
       btn.disabled = false;
       btn.innerHTML = '🔗 Vincular';
     } else {
-      if (d.error_code === "admin_verification_required") {
-        btn.disabled = false;
-        btn.innerHTML = '🔗 Vincular';
-        await loadChannelState(true);
-        openAdminAccessVerification();
-        return;
-      }
       toast("❌ " + (d.error || "Error"), "error");
       document.getElementById("tg-link-status").innerHTML = '❌ ' + (d.error || "Error");
       if (d.retry_after) armTgRetry(d.retry_after);
@@ -1832,7 +1853,7 @@ async function startWaSwitch(knownState=null) {
     return;
   }
   if (!latest.can_manage) {
-    openAdminAccessVerification();
+    guideChannelAdminRecovery();
     return;
   }
   const current = latest.whatsapp || {};
@@ -2342,6 +2363,20 @@ def _valid_telegram_credentials(api_id, api_hash: str, phone: str) -> bool:
         valid_id
         and re.fullmatch(r"[0-9a-fA-F]{32}", api_hash or "")
         and re.fullmatch(r"\+[0-9]{7,15}", phone or "")
+    )
+
+
+def _telegram_credentials_match_saved(api_id, api_hash: str, phone: str) -> bool:
+    """Recupera este navegador sólo si confirma la cuenta TG ya vinculada."""
+
+    saved_id = (os.environ.get("TG_API_ID") or _read_env_var("TG_API_ID") or "").strip()
+    saved_hash = (os.environ.get("TG_API_HASH") or _read_env_var("TG_API_HASH") or "").strip()
+    saved_phone_raw = (os.environ.get("TG_PHONE") or _read_env_var("TG_PHONE") or "").strip()
+    saved_phone = _normalize_telegram_phone(saved_phone_raw) or saved_phone_raw
+    return (
+        secrets.compare_digest(str(api_id), str(saved_id))
+        and secrets.compare_digest(api_hash, saved_hash)
+        and secrets.compare_digest(phone, saved_phone)
     )
 
 
@@ -3531,22 +3566,6 @@ def _finish_telegram_switch(outcome):
 @app.route("/api/link_telegram", methods=["POST"])
 def api_link_telegram():
     """Inicia una autorización y describe el canal elegido por Telegram."""
-    # Las credenciales MTProto identifican una aplicación; nunca se usan como
-    # contraseña del panel. Una cuenta ya vinculada se administra mediante el
-    # código temporal enviado por su propia sesión activa.
-    if _telegram_session_is_authorized():
-        if not _can_manage_channels():
-            return jsonify({
-                "ok": False,
-                "error_code": "admin_verification_required",
-                "error": "Telegram ya está vinculado. Verifica este navegador con el código enviado a Telegram.",
-            }), 409
-        return jsonify({
-            "ok": False,
-            "error_code": "already_linked",
-            "error": "Telegram ya está vinculado. Usa Cambiar cuenta si deseas reemplazarlo.",
-        }), 409
-
     data = request.get_json(silent=True) or {}
     api_id = data.get("api_id")
     api_hash = (data.get("api_hash") or "").strip()
@@ -3558,6 +3577,33 @@ def api_link_telegram():
             "error_code": "invalid_input",
             "error": "Revisa api_id, api_hash y el teléfono en formato internacional.",
         }), 400
+
+    # Recuperación por credenciales: una cuenta ya vinculada no se reemplaza.
+    # Las credenciales sólo confirman que este navegador administra esa misma
+    # cuenta; nunca se guardan de nuevo ni se solicita otro código de Telegram.
+    if _telegram_session_is_authorized():
+        if not _can_manage_channels():
+            if not _telegram_credentials_match_saved(api_id, api_hash, phone):
+                return jsonify({
+                    "ok": False,
+                    "error_code": "already_linked",
+                    "error": "Telegram ya está vinculado y las credenciales no coinciden.",
+                }), 403
+            session["channel_admin"] = True
+            session["channel_csrf"] = secrets.token_urlsafe(32)
+            session.permanent = True
+        if bot_is_running():
+            started, message = True, "Acceso administrativo recuperado; Telegram sigue en línea."
+        else:
+            started, message = restart_telegram_worker()
+        return jsonify({
+            "ok": started,
+            "already_authorized": True,
+            "worker_starting": started,
+            "message": message,
+            "csrf": session.get("channel_csrf") or _channel_csrf_token(),
+            **({} if started else {"error": message}),
+        })
 
     outcome = _telegram_auth.begin(
         int(api_id), api_hash, phone, data.get("auth_attempt")

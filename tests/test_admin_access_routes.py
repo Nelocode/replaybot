@@ -406,7 +406,7 @@ class AdminAccessRoutesTestCase(unittest.TestCase):
         save_creds.assert_not_called()
         write_marker.assert_not_called()
 
-    def test_linked_telegram_requires_admin_verification_before_input_validation(self):
+    def test_linked_telegram_recovery_rejects_invalid_input_before_comparison(self):
         manager = Mock()
         with (
             patch.object(
@@ -414,7 +414,11 @@ class AdminAccessRoutesTestCase(unittest.TestCase):
                 "_telegram_session_is_authorized",
                 return_value=True,
             ),
-            patch.object(app_module, "_valid_telegram_credentials") as validate,
+            patch.object(
+                app_module,
+                "_valid_telegram_credentials",
+                return_value=False,
+            ) as validate,
             patch.object(app_module, "restart_telegram_worker") as restart,
             patch.object(app_module, "_save_telegram_creds") as save_creds,
             patch.object(
@@ -433,12 +437,9 @@ class AdminAccessRoutesTestCase(unittest.TestCase):
                 headers=self.csrf_headers(),
             )
 
-        self.assertEqual(409, response.status_code)
-        self.assertEqual(
-            "admin_verification_required",
-            response.get_json()["error_code"],
-        )
-        validate.assert_not_called()
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("invalid_input", response.get_json()["error_code"])
+        validate.assert_called_once()
         manager.begin.assert_not_called()
         restart.assert_not_called()
         save_creds.assert_not_called()

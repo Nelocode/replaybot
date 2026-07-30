@@ -106,21 +106,15 @@ class AdminTemplateTestCase(unittest.TestCase):
         self.assertIn("let channelStateRequest = null;", template)
         self.assertIn("setInterval(loadChannelState, 10000);", template)
         self.assertIn('document.addEventListener("visibilitychange"', template)
-        self.assertIn("function openAdminAccessVerification()", template)
-        self.assertIn("🔐 Verificar navegador", template)
-        self.assertIn("Telegram sigue conectado", template)
-        self.assertNotIn("function guideChannelAdminRecovery()", template)
+        self.assertIn("function guideChannelAdminRecovery()", template)
+        self.assertIn("🔐 Administrar WA", template)
+        self.assertIn("🔐 Recuperar acceso", template)
+        self.assertIn("credenciales actuales de Telegram", template)
         self.assertIn("latest.whatsapp.reauth_required", template)
         self.assertIn("necesitas un QR nuevo", template)
 
-    def test_linked_telegram_uses_otp_instead_of_credentials(self):
+    def test_linked_telegram_uses_saved_credentials_for_legacy_recovery(self):
         template = app_module.TEMPLATE
-        self.assertIn('id="admin-access"', template)
-        self.assertIn("Enviar código a Telegram", template)
-        self.assertIn('id="admin-access-code"', template)
-        self.assertIn('pattern="[0-9]{8}"', template)
-        self.assertIn('maxlength="8"', template)
-        self.assertIn('autocomplete="one-time-code"', template)
 
         linked_state = re.search(
             r'if \(tg\.linked\) \{(?P<linked>.*?)\n  \} else \{(?P<unlinked>.*?)'
@@ -129,16 +123,15 @@ class AdminTemplateTestCase(unittest.TestCase):
             re.DOTALL,
         )
         self.assertIsNotNone(linked_state)
-        self.assertIn('tgInitial.style.display = "none";', linked_state.group("linked"))
+        self.assertIn(
+            'tgInitial.style.display = data.can_manage ? "none" : "block";',
+            linked_state.group("linked"),
+        )
         self.assertIn(
             'tgLinked.style.display = data.can_manage ? "block" : "none";',
             linked_state.group("linked"),
         )
-        self.assertIn(
-            'adminAccess.style.display = data.can_manage ? "none" : "block";',
-            linked_state.group("linked"),
-        )
-        self.assertNotIn('tgInitial.style.display = "block";', linked_state.group("linked"))
+        self.assertIn('adminAccess.style.display = "none";', linked_state.group("linked"))
         self.assertIn('tgInitial.style.display = "block";', linked_state.group("unlinked"))
         self.assertIn('adminAccess.style.display = "none";', linked_state.group("unlinked"))
 
@@ -149,9 +142,9 @@ class AdminTemplateTestCase(unittest.TestCase):
             re.DOTALL,
         )
         self.assertIsNotNone(link_telegram)
-        self.assertNotIn("already_authorized", link_telegram.group("body"))
-        self.assertNotIn("recoveredAdmin", link_telegram.group("body"))
-        self.assertIn("admin_verification_required", link_telegram.group("body"))
+        self.assertIn("already_authorized", link_telegram.group("body"))
+        self.assertIn("recoveredAdmin", link_telegram.group("body"))
+        self.assertNotIn("admin_verification_required", link_telegram.group("body"))
 
     def test_admin_access_flow_uses_csrf_and_refreshes_rotated_token(self):
         template = app_module.TEMPLATE
@@ -253,7 +246,7 @@ class AdminTemplateTestCase(unittest.TestCase):
             re.DOTALL,
         )
         self.assertIsNotNone(admin_guard)
-        self.assertIn("openAdminAccessVerification();", admin_guard.group("body"))
+        self.assertIn("guideChannelAdminRecovery();", admin_guard.group("body"))
         self.assertIn("return;", admin_guard.group("body"))
 
     def test_whatsapp_qr_keeps_its_space_and_only_reloads_new_revisions(self):
