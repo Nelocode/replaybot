@@ -266,7 +266,7 @@ class TelegramRoutesTestCase(unittest.TestCase):
         self.assertEqual(403, stale_csrf.status_code)
         self.assertEqual("csrf_invalid", stale_csrf.get_json()["error_code"])
 
-    def test_wrong_linked_telegram_credentials_do_not_recover_the_panel(self):
+    def test_wrong_linked_telegram_credentials_start_bound_otp_recovery(self):
         mismatches = (
             {"api_id": self.API_ID + 1, "api_hash": self.API_HASH, "phone": self.PHONE},
             {"api_id": self.API_ID, "api_hash": "f" * 32, "phone": self.PHONE},
@@ -290,17 +290,130 @@ class TelegramRoutesTestCase(unittest.TestCase):
                     patch.object(app_module, "_read_env_var", return_value=None),
                     patch.object(app_module, "_telegram_session_is_authorized", return_value=True),
                     patch.object(app_module, "bot_is_running", return_value=True),
+                    patch.object(app_module, "_panel_admin_access") as access_store,
                     patch.object(app_module, "_telegram_auth") as manager,
                     patch.object(app_module, "restart_telegram_worker") as restart,
+                    patch.object(app_module, "_save_telegram_creds") as save_creds,
+                    patch.object(app_module, "_write_telegram_authorized_marker") as write_marker,
                 ):
+                    access_store.create_challenge.return_value = {
+                        "ok": True,
+                        "state": "queued",
+                        "request_id": "bound-admin-recovery-request",
+                        "delivered": False,
+                        "expires_in": 180,
+                        "attempts_remaining": 5,
+                    }
                     response = self.client.post("/api/link_telegram", json=payload)
 
-                self.assertEqual(403, response.status_code)
-                self.assertEqual("already_linked", response.get_json()["error_code"])
+                self.assertEqual(200, response.status_code)
+                data = response.get_json()
+                self.assertTrue(data["ok"])
+                self.assertTrue(data["recovery_via_telegram"])
+                self.assertTrue(data["admin_verification_required"])
+                self.assertTrue(data["already_authorized"])
+                self.assertEqual("queued", data["state"])
+                self.assertEqual("bound-admin-recovery-request", data["request_id"])
+                self.assertNotIn("csrf", data)
+                access_store.create_challenge.assert_called_once()
+                browser_token = access_store.create_challenge.call_args.args[0]
+                self.assertGreaterEqual(len(browser_token), 32)
                 manager.begin.assert_not_called()
                 restart.assert_not_called()
+                save_creds.assert_not_called()
+                write_marker.assert_not_called()
                 with self.client.session_transaction() as browser_session:
                     self.assertFalse(browser_session.get("channel_admin"))
+                    self.assertEqual(
+                        browser_token,
+                        browser_session.get("admin_access_browser"),
+                    )
+                self.assert_response_does_not_contain_secrets(
+                    response,
+                    payload["api_hash"],
+                    payload["phone"],
+                    browser_token,
+                )
+
+    def test_mismatch_otp_recovery_does_not_restart_offline_telegram(self):
+        payload = {
+            "api_id": self.API_ID + 1,
+            "api_hash": self.API_HASH,
+            "phone": self.PHONE,
+        }
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "TG_API_ID": str(self.API_ID),
+                    "TG_API_HASH": self.API_HASH,
+                    "TG_PHONE": self.PHONE,
+                },
+                clear=True,
+            ),
+            patch.object(app_module, "_read_env_var", return_value=None),
+            patch.object(app_module, "_telegram_session_is_authorized", return_value=True),
+            patch.object(app_module, "bot_is_running", return_value=False),
+            patch.object(app_module, "_panel_admin_access") as access_store,
+            patch.object(app_module, "_telegram_auth") as manager,
+            patch.object(app_module, "restart_telegram_worker") as restart,
+        ):
+            response = self.client.post("/api/link_telegram", json=payload)
+
+        self.assertEqual(503, response.status_code)
+        data = response.get_json()
+        self.assertFalse(data["ok"])
+        self.assertEqual("telegram_offline", data["error_code"])
+        self.assertTrue(data["recovery_via_telegram"])
+        self.assertTrue(data["admin_verification_required"])
+        self.assertTrue(data["already_authorized"])
+        access_store.create_challenge.assert_not_called()
+        manager.begin.assert_not_called()
+        restart.assert_not_called()
+        with self.client.session_transaction() as browser_session:
+            self.assertFalse(browser_session.get("channel_admin"))
+            self.assertFalse(browser_session.get("admin_access_browser"))
+
+    def test_mismatch_otp_recovery_preserves_rate_limit_status(self):
+        payload = {
+            "api_id": self.API_ID + 1,
+            "api_hash": self.API_HASH,
+            "phone": self.PHONE,
+        }
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "TG_API_ID": str(self.API_ID),
+                    "TG_API_HASH": self.API_HASH,
+                    "TG_PHONE": self.PHONE,
+                },
+                clear=True,
+            ),
+            patch.object(app_module, "_read_env_var", return_value=None),
+            patch.object(app_module, "_telegram_session_is_authorized", return_value=True),
+            patch.object(app_module, "bot_is_running", return_value=True),
+            patch.object(app_module, "_panel_admin_access") as access_store,
+            patch.object(app_module, "restart_telegram_worker") as restart,
+        ):
+            access_store.create_challenge.return_value = {
+                "ok": False,
+                "state": "rate_limited",
+                "error_code": "rate_limited",
+                "retry_after": 47,
+                "error": "Espera antes de solicitar otro código.",
+            }
+            response = self.client.post("/api/link_telegram", json=payload)
+
+        self.assertEqual(429, response.status_code)
+        data = response.get_json()
+        self.assertFalse(data["ok"])
+        self.assertEqual("rate_limited", data["error_code"])
+        self.assertEqual(47, data["retry_after"])
+        self.assertTrue(data["recovery_via_telegram"])
+        self.assertTrue(data["admin_verification_required"])
+        access_store.create_challenge.assert_called_once()
+        restart.assert_not_called()
 
     def test_persisted_credentials_recover_when_container_environment_is_stale(self):
         payload = {

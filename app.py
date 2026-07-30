@@ -1634,7 +1634,40 @@ async function linkTelegram() {
       body: JSON.stringify(payload)
     });
     const d = await r.json();
-    if (d.needs_code) {
+    if (d.recovery_via_telegram) {
+      clearTgAttempt();
+      document.getElementById("tg-api-hash").value = "";
+      document.getElementById("tg-credentials-help").style.display = "none";
+      document.getElementById("tg-initial-link").style.display = "none";
+      document.getElementById("tg-linked-actions").style.display = "none";
+      const adminPanel = document.getElementById("admin-access");
+      adminPanel.style.display = "block";
+      renderAdminAccessState(d);
+      const challengeState = adminAccessState(d);
+      const awaitingCode = ["pending", "queued", "delivered", "awaiting_code"].includes(challengeState);
+      if (awaitingCode) {
+        document.getElementById("admin-access-code-section").style.display = "block";
+        document.getElementById("admin-access-code").value = "";
+        document.getElementById("admin-access-code").focus();
+      }
+      if (!r.ok || d.ok === false) {
+        const message = d.error || "No fue posible enviar el código a Telegram";
+        setAdminAccessStatus(message, "error");
+        toast("❌ " + message, "error");
+      } else {
+        document.getElementById("tg-link-status").innerHTML =
+          "📨 Usa el código enviado a la cuenta de Telegram vinculada.";
+        toast(
+          ["delivered", "awaiting_code"].includes(challengeState)
+            ? "📨 Código enviado a Telegram"
+            : "📨 Preparando el código en Telegram",
+          "success"
+        );
+      }
+      btn.disabled = false;
+      btn.innerHTML = "🔐 Recuperar acceso";
+      return;
+    } else if (d.needs_code) {
       if (d.auth_attempt) {
         rememberTgAttempt("link", d.auth_attempt);
       }
@@ -1678,6 +1711,19 @@ async function linkTelegram() {
       btn.disabled = false;
       btn.innerHTML = '🔗 Vincular';
     } else {
+      const credentialMismatch = recoveringAdmin &&
+        ["already_linked", "credential_mismatch"].includes(d.error_code);
+      if (credentialMismatch) {
+        clearTgAttempt();
+        document.getElementById("tg-api-hash").value = "";
+        btn.disabled = false;
+        btn.innerHTML = "🔐 Recuperar acceso";
+        await loadChannelState(true);
+        openAdminAccessVerification();
+        await loadAdminAccessStatus();
+        await requestAdminAccess();
+        return;
+      }
       toast("❌ " + (d.error || "Error"), "error");
       document.getElementById("tg-link-status").innerHTML = '❌ ' + (d.error || "Error");
       if (d.retry_after) armTgRetry(d.retry_after);
@@ -3450,6 +3496,28 @@ def _admin_access_response_status(result: dict) -> int:
     }.get(error_code, 200 if result.get("ok") else 400)
 
 
+def _create_admin_access_challenge() -> tuple[dict, int]:
+    """Prepara el OTP del panel sin abrir, reemplazar ni reiniciar Telegram."""
+
+    if not _telegram_session_is_authorized():
+        return {
+            "ok": False,
+            "error_code": "telegram_not_linked",
+            "error": "Telegram todavía no está vinculado.",
+        }, 409
+
+    if not bot_is_running():
+        return {
+            "ok": False,
+            "error_code": "telegram_offline",
+            "error": "Telegram está vinculado, pero el servicio de entrega está fuera de línea.",
+        }, 503
+
+    browser_token = _admin_access_browser_token(create=True)
+    result = _panel_admin_access.create_challenge(browser_token)
+    return result, _admin_access_response_status(result)
+
+
 @app.route("/api/admin_access/request", methods=["POST"])
 def api_admin_access_request():
     """Envía un OTP por la cuenta TG ya activa, sin pedir credenciales MTProto."""
@@ -3464,23 +3532,8 @@ def api_admin_access_request():
             "state": "verified",
             "csrf": _channel_csrf_token(),
         })
-    if not _telegram_session_is_authorized():
-        return jsonify({
-            "ok": False,
-            "error_code": "telegram_not_linked",
-            "error": "Telegram todavía no está vinculado.",
-        }), 409
-
-    if not bot_is_running():
-        return jsonify({
-            "ok": False,
-            "error_code": "telegram_offline",
-            "error": "Telegram está vinculado, pero el servicio de entrega está fuera de línea.",
-        }), 503
-
-    browser_token = _admin_access_browser_token(create=True)
-    result = _panel_admin_access.create_challenge(browser_token)
-    return jsonify(result), _admin_access_response_status(result)
+    result, status = _create_admin_access_challenge()
+    return jsonify(result), status
 
 
 @app.route("/api/admin_access/status")
@@ -3609,11 +3662,18 @@ def api_link_telegram():
     if _telegram_session_is_authorized():
         if not _can_manage_channels():
             if not _telegram_credentials_match_saved(api_id, api_hash, phone):
-                return jsonify({
-                    "ok": False,
-                    "error_code": "already_linked",
-                    "error": "Telegram ya está vinculado y las credenciales no coinciden.",
-                }), 403
+                result, status = _create_admin_access_challenge()
+                result.update({
+                    "recovery_via_telegram": True,
+                    "admin_verification_required": True,
+                    "already_authorized": True,
+                })
+                if result.get("ok"):
+                    result["message"] = (
+                        "Los datos no coinciden. Enviamos un código de acceso "
+                        "a Mensajes guardados de la cuenta de Telegram vinculada."
+                    )
+                return jsonify(result), status
             session["channel_admin"] = True
             session["channel_csrf"] = secrets.token_urlsafe(32)
             session.permanent = True
