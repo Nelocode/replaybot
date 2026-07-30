@@ -64,6 +64,29 @@ class AdminTemplateTestCase(unittest.TestCase):
             len(re.findall(r'class="[^"]*\bwa-switch-cancel\b[^"]*"', template)),
         )
 
+    def test_telegram_audio_labels_are_editable_without_restarting_workers(self):
+        template = app_module.TEMPLATE
+        self.assertIn('id="tg-audio-performer"', template)
+        self.assertIn('id="tg-audio-title"', template)
+        self.assertIn('placeholder="Caché Madrid"', template)
+        self.assertIn('fetch("/api/telegram_audio_branding"', template)
+        self.assertIn("JSON.stringify({title, performer})", template)
+        self.assertIn("let tgAudioBrandingDirty = false", template)
+        self.assertIn("if (tgAudioBrandingDirty)", template)
+        self.assertIn("headers: channelHeaders()", template)
+
+    def test_test_mode_can_reset_the_latest_conversation_per_channel(self):
+        template = app_module.TEMPLATE
+        self.assertIn('id="test-mode-card"', template)
+        self.assertIn('fetch("/api/test_mode"', template)
+        self.assertIn('fetch("/api/test_mode/reset"', template)
+        self.assertIn("resetTestConversation('telegram')", template)
+        self.assertIn("resetTestConversation('whatsapp')", template)
+        self.assertIn("resetTestConversation('both')", template)
+        self.assertIn('id="test-mode-language"', template)
+        self.assertIn("body: JSON.stringify({channel, language, confirm: true})", template)
+        self.assertIn("Úsalo sin tráfico real simultáneo", template)
+
     def test_whatsapp_state_refresh_and_recovery_are_actionable(self):
         template = app_module.TEMPLATE
         self.assertIn('fetch("/api/data", {cache: "no-store"})', template)
@@ -220,6 +243,26 @@ class AdminTemplateTestCase(unittest.TestCase):
         self.assertIsNotNone(admin_guard)
         self.assertIn("openAdminAccessVerification();", admin_guard.group("body"))
         self.assertIn("return;", admin_guard.group("body"))
+
+    def test_whatsapp_qr_keeps_its_space_and_only_reloads_new_revisions(self):
+        template = app_module.TEMPLATE
+        self.assertIn(
+            'id="wa-qr-img" alt="QR WhatsApp" '
+            'style="visibility:hidden;display:inline-block;width:300px;height:300px;',
+            template,
+        )
+        self.assertIn("let waQrLoadGeneration = 0;", template)
+        self.assertIn("function showWaQrImage(revision=null)", template)
+        self.assertIn("image.dataset.qrRevision === requestedRevision", template)
+        self.assertIn("image.dataset.pendingQrRevision === requestedRevision", template)
+        self.assertIn("const nextImage = new Image();", template)
+        self.assertIn('image.style.visibility = "visible";', template)
+        self.assertIn("showWaQrImage(data.qr_revision);", template)
+        self.assertIn("showWaQrImage(d.qr_revision);", template)
+        self.assertNotIn(
+            'img.src = "/api/switch_wa/qr?ts=" + Date.now();',
+            template,
+        )
 
 
 if __name__ == "__main__":

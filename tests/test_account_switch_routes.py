@@ -572,6 +572,7 @@ class AccountSwitchRoutesTestCase(unittest.TestCase):
         self.assertEqual(200, claimed.status_code)
         self.assertTrue(claimed.get_json()["ok"])
         self.assertTrue(claimed.get_json()["qr_ready"])
+        self.assertEqual(app_module._wa_qr_revision(), claimed.get_json()["qr_revision"])
         self.assertEqual(200, current_qr.status_code)
         current_qr.close()
         self.assertEqual(404, previous_status.status_code)
@@ -583,6 +584,35 @@ class AccountSwitchRoutesTestCase(unittest.TestCase):
         self.assertNotEqual(app_module._wa_switch_token_digest(previous_token), operation["token_hash"])
         self.assertEqual(original_started_at, operation["started_at"])
         schedule.assert_called_once()
+
+    def test_status_revision_changes_only_when_qr_content_changes(self):
+        self.authorize_browser()
+        token = "current-browser"
+        self.wa_switch_dir.mkdir(parents=True)
+        app_module.WA_SWITCH_QR_FILE.write_bytes(b"first-qr")
+        app_module._save_wa_switch_operation({
+            "version": 1,
+            "token_hash": app_module._wa_switch_token_digest(token),
+            "started_at": time.time(),
+            "status": "preparing",
+        })
+        with self.client.session_transaction() as browser_session:
+            browser_session["wa_switch_token"] = token
+
+        with (
+            patch.object(app_module, "_wa_process_running", return_value=True),
+            patch.object(app_module, "_wa_connection_open", return_value=False),
+        ):
+            first = self.client.get("/api/switch_wa/status").get_json()
+            second = self.client.get("/api/switch_wa/status").get_json()
+            app_module.WA_SWITCH_QR_FILE.write_bytes(b"second-qr")
+            changed = self.client.get("/api/switch_wa/status").get_json()
+
+        self.assertTrue(first["qr_ready"])
+        self.assertEqual("awaiting_qr", first["state"])
+        self.assertEqual(first["qr_revision"], second["qr_revision"])
+        self.assertNotEqual(first["qr_revision"], changed["qr_revision"])
+        self.assertRegex(first["qr_revision"], r"^[0-9a-f]{24}$")
 
     def test_status_is_read_only_and_commit_promotes_once(self):
         self.seed_active_whatsapp()

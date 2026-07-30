@@ -30,6 +30,7 @@ from panel_admin_access import deliver_pending_challenge
 from telegram_audio_branding import (
     brand_audio_attributes,
     build_branded_audio_media,
+    resolve_audio_cover_path,
 )
 from telegram_call_rejection import TelegramCallRejectCoordinator
 from telegram_events import (
@@ -53,7 +54,9 @@ from telegram_dispatcher import (
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 AUDIO_DIR = DATA_DIR / "audios"
-AUDIO_COVER_PATH = BASE_DIR / "assets" / "audio-cover.jpg"
+AUDIO_COVER_PATH = resolve_audio_cover_path(BASE_DIR)
+AUDIO_BRANDING_DEFAULTS_FILE = BASE_DIR / "telegram_audio_branding.defaults.json"
+AUDIO_BRANDING_SETTINGS_FILE = DATA_DIR / "telegram_audio_branding.json"
 MESSAGES_FILE = DATA_DIR / "messages.json"
 DEFAULT_MESSAGES_FILE = BASE_DIR / "messages.json"
 SESSION_FILE = str(DATA_DIR / "tg_session")
@@ -418,6 +421,8 @@ async def send_response(
         audio_attributes = brand_audio_attributes(
             audio_attributes,
             filename=audio_path.name,
+            defaults_path=AUDIO_BRANDING_DEFAULTS_FILE,
+            settings_path=AUDIO_BRANDING_SETTINGS_FILE,
         )
 
         async def send_audio_media():
