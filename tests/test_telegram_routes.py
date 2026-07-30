@@ -302,6 +302,41 @@ class TelegramRoutesTestCase(unittest.TestCase):
                 with self.client.session_transaction() as browser_session:
                     self.assertFalse(browser_session.get("channel_admin"))
 
+    def test_persisted_credentials_recover_when_container_environment_is_stale(self):
+        payload = {
+            "api_id": self.API_ID,
+            "api_hash": self.API_HASH,
+            "phone": self.PHONE,
+        }
+        persisted = {
+            "TG_API_ID": "000" + str(self.API_ID),
+            "TG_API_HASH": self.API_HASH.upper(),
+            "TG_PHONE": self.PHONE,
+        }
+        stale_environment = {
+            "TG_API_ID": str(self.API_ID + 99),
+            "TG_API_HASH": "e" * 32,
+            "TG_PHONE": "+570000000099",
+        }
+        with (
+            patch.dict(os.environ, stale_environment, clear=True),
+            patch.object(
+                app_module,
+                "_read_env_var",
+                side_effect=lambda key: persisted.get(key),
+            ),
+            patch.object(app_module, "_telegram_session_is_authorized", return_value=True),
+            patch.object(app_module, "bot_is_running", return_value=True),
+            patch.object(app_module, "_telegram_auth") as manager,
+            patch.object(app_module, "restart_telegram_worker") as restart,
+        ):
+            response = self.client.post("/api/link_telegram", json=payload)
+
+        self.assertEqual(200, response.status_code)
+        self.assertTrue(response.get_json()["already_authorized"])
+        manager.begin.assert_not_called()
+        restart.assert_not_called()
+
     def test_admin_browser_uses_change_account_instead_of_relinking(self):
         payload = {
             "api_id": self.API_ID,

@@ -2369,15 +2369,40 @@ def _valid_telegram_credentials(api_id, api_hash: str, phone: str) -> bool:
 def _telegram_credentials_match_saved(api_id, api_hash: str, phone: str) -> bool:
     """Recupera este navegador sólo si confirma la cuenta TG ya vinculada."""
 
-    saved_id = (os.environ.get("TG_API_ID") or _read_env_var("TG_API_ID") or "").strip()
-    saved_hash = (os.environ.get("TG_API_HASH") or _read_env_var("TG_API_HASH") or "").strip()
-    saved_phone_raw = (os.environ.get("TG_PHONE") or _read_env_var("TG_PHONE") or "").strip()
-    saved_phone = _normalize_telegram_phone(saved_phone_raw) or saved_phone_raw
-    return (
-        secrets.compare_digest(str(api_id), str(saved_id))
-        and secrets.compare_digest(api_hash, saved_hash)
-        and secrets.compare_digest(phone, saved_phone)
+    candidates = (
+        (
+            os.environ.get("TG_API_ID") or "",
+            os.environ.get("TG_API_HASH") or "",
+            os.environ.get("TG_PHONE") or "",
+        ),
+        (
+            _read_env_var("TG_API_ID") or "",
+            _read_env_var("TG_API_HASH") or "",
+            _read_env_var("TG_PHONE") or "",
+        ),
     )
+    try:
+        normalized_api_id = str(int(api_id))
+    except (TypeError, ValueError):
+        return False
+    normalized_api_hash = api_hash.strip().lower()
+    for saved_id_raw, saved_hash_raw, saved_phone_raw in candidates:
+        try:
+            saved_id = str(int(str(saved_id_raw).strip()))
+        except (TypeError, ValueError):
+            continue
+        saved_hash = str(saved_hash_raw).strip().lower()
+        saved_phone_text = str(saved_phone_raw).strip()
+        saved_phone = _normalize_telegram_phone(saved_phone_text) or saved_phone_text
+        if not saved_id or not saved_hash or not saved_phone:
+            continue
+        if (
+            secrets.compare_digest(normalized_api_id, saved_id)
+            and secrets.compare_digest(normalized_api_hash, saved_hash)
+            and secrets.compare_digest(phone, saved_phone)
+        ):
+            return True
+    return False
 
 
 def _save_telegram_creds(api_id, api_hash, phone):
