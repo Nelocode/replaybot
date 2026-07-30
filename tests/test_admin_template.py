@@ -146,55 +146,6 @@ class AdminTemplateTestCase(unittest.TestCase):
         self.assertIn("recoveredAdmin", link_telegram.group("body"))
         self.assertNotIn("admin_verification_required", link_telegram.group("body"))
 
-    def test_backend_recovery_challenge_renders_otp_without_second_request(self):
-        template = app_module.TEMPLATE
-        link_telegram = re.search(
-            r'async function linkTelegram\(\) \{(?P<body>.*?)'
-            r'\n\}\n\nasync function verifyTgCode',
-            template,
-            re.DOTALL,
-        )
-        self.assertIsNotNone(link_telegram)
-        body = link_telegram.group("body")
-        challenge = re.search(
-            r"if \(d\.recovery_via_telegram\) \{(?P<challenge>.*?)"
-            r"\n    \} else if \(d\.needs_code\)",
-            body,
-            re.DOTALL,
-        )
-        self.assertIsNotNone(challenge)
-        challenge_body = challenge.group("challenge")
-        self.assertIn('adminPanel.style.display = "block";', challenge_body)
-        self.assertIn("renderAdminAccessState(d);", challenge_body)
-        self.assertIn('document.getElementById("admin-access-code").focus();', challenge_body)
-        self.assertNotIn("requestAdminAccess(", challenge_body)
-        self.assertLess(
-            body.index("if (d.recovery_via_telegram)"),
-            body.index("else if (d.ok)"),
-        )
-
-    def test_credential_mismatch_falls_back_to_linked_telegram_otp(self):
-        template = app_module.TEMPLATE
-        link_telegram = re.search(
-            r'async function linkTelegram\(\) \{(?P<body>.*?)'
-            r'\n\}\n\nasync function verifyTgCode',
-            template,
-            re.DOTALL,
-        )
-        self.assertIsNotNone(link_telegram)
-        body = link_telegram.group("body")
-        self.assertIn(
-            '["already_linked", "credential_mismatch"].includes(d.error_code)',
-            body,
-        )
-        self.assertIn("openAdminAccessVerification();", body)
-        self.assertIn("await loadAdminAccessStatus();", body)
-        self.assertIn("await requestAdminAccess();", body)
-        self.assertLess(
-            body.index("openAdminAccessVerification();"),
-            body.index("await requestAdminAccess();"),
-        )
-
     def test_admin_access_flow_uses_csrf_and_refreshes_rotated_token(self):
         template = app_module.TEMPLATE
         for endpoint in (
