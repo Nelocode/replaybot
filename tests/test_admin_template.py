@@ -9,6 +9,18 @@ import app as app_module
 
 
 class AdminTemplateTestCase(unittest.TestCase):
+    def test_panel_document_is_never_cached(self):
+        with app_module.app.test_client() as client:
+            response = client.get("/")
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(
+            "no-store, no-cache, must-revalidate, max-age=0",
+            response.headers["Cache-Control"],
+        )
+        self.assertEqual("no-cache", response.headers["Pragma"])
+        self.assertEqual("0", response.headers["Expires"])
+
     def test_every_inline_click_handler_exists(self):
         handlers = set(re.findall(r'onclick="([A-Za-z_$][\w$]*)\(', app_module.TEMPLATE))
         definitions = set(

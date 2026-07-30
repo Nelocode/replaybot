@@ -16,7 +16,15 @@ import threading
 import time
 from datetime import timedelta
 from pathlib import Path
-from flask import Flask, render_template_string, request, jsonify, send_from_directory, session
+from flask import (
+    Flask,
+    jsonify,
+    make_response,
+    render_template_string,
+    request,
+    send_from_directory,
+    session,
+)
 from telegram_auth import TelegramAuthManager
 from message_schema import load_message_file
 from panel_admin_access import PanelAdminAccessStore
@@ -2709,7 +2717,11 @@ def _promote_telegram_candidate(
 
 @app.route("/")
 def index():
-    return render_template_string(TEMPLATE)
+    response = make_response(render_template_string(TEMPLATE))
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 @app.route("/preview/<lang>")
 def preview(lang):
