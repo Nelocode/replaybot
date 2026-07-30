@@ -7,12 +7,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 import app as app_module
+from tests.admin_session import grant_operator_admin, install_operator_key
 
 
 class AccountSwitchRoutesTestCase(unittest.TestCase):
     CSRF = "c" * 48
 
     def setUp(self):
+        self.operator_key = install_operator_key(self)
         app_module.app.config.update(TESTING=True)
         self.client = app_module.app.test_client()
         self.temporary = tempfile.TemporaryDirectory()
@@ -43,9 +45,11 @@ class AccountSwitchRoutesTestCase(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     def authorize_browser(self):
-        with self.client.session_transaction() as browser_session:
-            browser_session["wa_admin"] = True
-            browser_session["channel_csrf"] = self.CSRF
+        grant_operator_admin(
+            self.client,
+            self.operator_key,
+            csrf=self.CSRF,
+        )
 
     def mutation_headers(self, token=None):
         return {"X-Channel-CSRF": token or self.CSRF}
@@ -541,9 +545,12 @@ class AccountSwitchRoutesTestCase(unittest.TestCase):
         self.authorize_browser()
         previous_token = "previous-browser"
         previous_client = app_module.app.test_client()
+        grant_operator_admin(
+            previous_client,
+            self.operator_key,
+            csrf=self.CSRF,
+        )
         with previous_client.session_transaction() as browser_session:
-            browser_session["wa_admin"] = True
-            browser_session["channel_csrf"] = self.CSRF
             browser_session["wa_switch_token"] = previous_token
 
         self.wa_switch_dir.mkdir(parents=True)

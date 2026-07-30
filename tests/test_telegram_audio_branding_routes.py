@@ -6,12 +6,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 import app as app_module
+from tests.admin_session import grant_operator_admin, install_operator_key
 
 
 class TelegramAudioBrandingRoutesTests(unittest.TestCase):
     CSRF = "b" * 48
 
     def setUp(self):
+        self.operator_key = install_operator_key(self)
         app_module.app.config.update(TESTING=True)
         self.client = app_module.app.test_client()
         self.temporary = tempfile.TemporaryDirectory()
@@ -34,9 +36,11 @@ class TelegramAudioBrandingRoutesTests(unittest.TestCase):
         self.addCleanup(environment_patcher.stop)
 
     def authorize_browser(self):
-        with self.client.session_transaction() as browser_session:
-            browser_session["channel_admin"] = True
-            browser_session["channel_csrf"] = self.CSRF
+        grant_operator_admin(
+            self.client,
+            self.operator_key,
+            csrf=self.CSRF,
+        )
 
     def headers(self, token=None):
         return {"X-Channel-CSRF": token or self.CSRF}

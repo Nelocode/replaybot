@@ -30,11 +30,23 @@ done
 # El migrador compara hashes, crea respaldo y no toca audios personalizados.
 python /app/audio_migrations.py /app/data/audios /app/audios
 
-# ── 1. Cargar variables de entorno desde .env.local de forma segura ──
+# ── 1. Cargar sólo credenciales conocidas, sin ejecutar .env.local ──
 if [ -f /app/data/.env.local ]; then
-    set -a
-    source /app/data/.env.local 2>/dev/null || true
-    set +a
+    while IFS='=' read -r env_key env_value; do
+        env_key="${env_key#${env_key%%[![:space:]]*}}"
+        env_key="${env_key%${env_key##*[![:space:]]}}"
+        env_value="${env_value%$'\r'}"
+        case "$env_key" in
+            TG_API_ID|TG_API_HASH|TG_PHONE|AUTOREPLY_BOT_TOKEN)
+                if [[ "$env_value" == \"*\" && "$env_value" == *\" ]]; then
+                    env_value="${env_value:1:${#env_value}-2}"
+                elif [[ "$env_value" == \'*\' && "$env_value" == *\' ]]; then
+                    env_value="${env_value:1:${#env_value}-2}"
+                fi
+                export "$env_key=$env_value"
+                ;;
+        esac
+    done < /app/data/.env.local
 fi
 
 # ── 2. Bot Telegram (User Bot - Telethon) ────────────────────────────
@@ -42,7 +54,7 @@ if [ -n "$TG_API_ID" ] && [ -n "$TG_API_HASH" ] \
    && [ -f /app/data/tg_session.session ] \
    && [ -f /app/data/tg_session_authorized.json ]; then
     echo "📱 Iniciando Bot Telegram (User Bot)..."
-    nohup python bot.py > /tmp/bot_tg.log 2>&1 &
+    nohup env -u PANEL_ADMIN_RECOVERY_KEY python bot.py > /tmp/bot_tg.log 2>&1 &
     echo $! > /app/data/tg_userbot.pid
     echo "  → PID: $!"
 elif [ -n "$TG_API_ID" ] && [ -n "$TG_API_HASH" ]; then
@@ -54,7 +66,7 @@ fi
 # ── 3. Bot Telegram (BotFather - Bot API) ───────────────────────────
 if [ -n "$AUTOREPLY_BOT_TOKEN" ]; then
     echo "🤖 Iniciando BotFather Bot..."
-    nohup python botfather_bot.py > /tmp/bot_bf.log 2>&1 &
+    nohup env -u PANEL_ADMIN_RECOVERY_KEY python botfather_bot.py > /tmp/bot_bf.log 2>&1 &
     echo $! > /app/data/botfather.pid
     echo "  → PID: $!"
 else
@@ -64,7 +76,7 @@ fi
 # ── 4. Bot WhatsApp ──────────────────────────────────────────────────
 if [ -d "/app/data/wa_auth" ] && [ "$(ls -A /app/data/wa_auth 2>/dev/null)" ]; then
     echo "💬 Iniciando Bot WhatsApp..."
-    nohup node wa_bot.mjs > /tmp/bot_wa.log 2>&1 &
+    nohup env -u PANEL_ADMIN_RECOVERY_KEY node wa_bot.mjs > /tmp/bot_wa.log 2>&1 &
     echo $! > /app/data/wa_bot.pid
     echo "  → PID: $!"
 else
@@ -74,4 +86,3 @@ fi
 # ── 5. Panel Admin ───────────────────────────────────────────────────
 echo "🖥️  Iniciando Panel Admin..."
 exec gunicorn -w 1 -b 0.0.0.0:5000 --access-logfile - --error-logfile - --timeout 120 app:app
-

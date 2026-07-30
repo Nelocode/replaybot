@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import app as app_module
+from tests.admin_session import grant_operator_admin, install_operator_key
 from telegram_auth import AuthOutcome
 
 
@@ -17,6 +18,7 @@ class TelegramSwitchRoutesTestCase(unittest.TestCase):
     CSRF = "t" * 48
 
     def setUp(self):
+        self.operator_key = install_operator_key(self)
         app_module.app.config.update(TESTING=True)
         self.client = app_module.app.test_client()
         self.temporary = tempfile.TemporaryDirectory()
@@ -32,9 +34,11 @@ class TelegramSwitchRoutesTestCase(unittest.TestCase):
             patcher = patch.object(app_module, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        with self.client.session_transaction() as browser_session:
-            browser_session["telegram_admin"] = True
-            browser_session["channel_csrf"] = self.CSRF
+        grant_operator_admin(
+            self.client,
+            self.operator_key,
+            csrf=self.CSRF,
+        )
 
     def headers(self):
         return {"X-Channel-CSRF": self.CSRF}

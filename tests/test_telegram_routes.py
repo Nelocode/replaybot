@@ -1,4 +1,5 @@
 import os
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -12,14 +13,30 @@ class TelegramRoutesTestCase(unittest.TestCase):
     PHONE = "+570000000000"
     ATTEMPT = "opaque-browser-attempt-token"
     CODE = "24680"
+    OPERATOR_KEY = "telegram-route-test-key-" + ("K" * 32)
 
     def setUp(self):
+        operator_key_patcher = patch.object(
+            app_module,
+            "_configured_operator_recovery_key",
+            return_value=self.OPERATOR_KEY,
+        )
+        operator_key_patcher.start()
+        self.addCleanup(operator_key_patcher.stop)
         app_module.app.config.update(TESTING=True)
         self.client = app_module.app.test_client()
         self.csrf = "t" * 48
+        self.authorize_browser()
+        self.client.environ_base["HTTP_X_CHANNEL_CSRF"] = self.csrf
+
+    def authorize_browser(self):
         with self.client.session_transaction() as browser_session:
             browser_session["channel_csrf"] = self.csrf
-        self.client.environ_base["HTTP_X_CHANNEL_CSRF"] = self.csrf
+            browser_session["channel_admin"] = True
+            browser_session["operator_recovery_key_version"] = (
+                app_module._operator_recovery_key_version(self.OPERATOR_KEY)
+            )
+            browser_session["operator_recovery_verified_at"] = time.time()
 
     def assert_response_does_not_contain_secrets(self, response, *secrets):
         body = response.get_data(as_text=True)
@@ -210,6 +227,8 @@ class TelegramRoutesTestCase(unittest.TestCase):
         )
 
     def test_restart_requires_the_browser_that_authorized_telegram(self):
+        with self.client.session_transaction() as browser_session:
+            browser_session.pop("channel_admin", None)
         with patch.object(app_module, "restart_telegram_worker") as restart:
             response = self.client.post("/api/restart_bot")
 
@@ -217,12 +236,14 @@ class TelegramRoutesTestCase(unittest.TestCase):
         self.assertFalse(response.get_json()["ok"])
         restart.assert_not_called()
 
-    def test_linked_telegram_credentials_recover_the_panel_without_relinking(self):
+    def test_linked_telegram_credentials_never_bootstrap_panel_authority(self):
         payload = {
             "api_id": self.API_ID,
             "api_hash": self.API_HASH,
             "phone": self.PHONE,
         }
+        with self.client.session_transaction() as browser_session:
+            browser_session.pop("channel_admin", None)
         with (
             patch.dict(
                 os.environ,
@@ -233,9 +254,9 @@ class TelegramRoutesTestCase(unittest.TestCase):
                 },
                 clear=True,
             ),
-            patch.object(app_module, "_read_env_var", return_value=None),
             patch.object(app_module, "_telegram_session_is_authorized", return_value=True),
-            patch.object(app_module, "bot_is_running", return_value=True),
+            patch.object(app_module, "_valid_telegram_credentials") as validate,
+            patch.object(app_module, "bot_is_running") as running,
             patch.object(app_module, "_telegram_auth") as manager,
             patch.object(app_module, "restart_telegram_worker") as restart,
             patch.object(app_module, "_save_telegram_creds") as save_creds,
@@ -243,97 +264,39 @@ class TelegramRoutesTestCase(unittest.TestCase):
         ):
             response = self.client.post("/api/link_telegram", json=payload)
 
-        self.assertEqual(200, response.status_code)
+        self.assertEqual(403, response.status_code)
         data = response.get_json()
-        self.assertTrue(data["ok"])
-        self.assertTrue(data["already_authorized"])
-        self.assertTrue(data["worker_starting"])
-        self.assertNotEqual(self.csrf, data["csrf"])
+        self.assertFalse(data["ok"])
+        self.assertEqual("admin_required", data["error_code"])
+        validate.assert_not_called()
+        running.assert_not_called()
         manager.begin.assert_not_called()
         restart.assert_not_called()
         save_creds.assert_not_called()
         write_marker.assert_not_called()
         with self.client.session_transaction() as browser_session:
-            self.assertTrue(browser_session.get("channel_admin"))
-            self.assertEqual(data["csrf"], browser_session.get("channel_csrf"))
-            self.assertTrue(browser_session.permanent)
+            self.assertFalse(browser_session.get("channel_admin"))
+            self.assertEqual(self.csrf, browser_session.get("channel_csrf"))
 
-        stale_csrf = self.client.post(
-            "/api/messages",
-            json={"lang": "es", "step": 0, "text": "x", "action": "edit_text"},
-            headers={"X-Channel-CSRF": self.csrf},
-        )
-        self.assertEqual(403, stale_csrf.status_code)
-        self.assertEqual("csrf_invalid", stale_csrf.get_json()["error_code"])
-
-    def test_wrong_linked_telegram_credentials_do_not_recover_the_panel(self):
-        mismatches = (
-            {"api_id": self.API_ID + 1, "api_hash": self.API_HASH, "phone": self.PHONE},
-            {"api_id": self.API_ID, "api_hash": "f" * 32, "phone": self.PHONE},
-            {"api_id": self.API_ID, "api_hash": self.API_HASH, "phone": "+570000000001"},
-        )
-        for payload in mismatches:
-            with self.subTest(payload_field=next(
-                key for key, value in payload.items()
-                if value != {"api_id": self.API_ID, "api_hash": self.API_HASH, "phone": self.PHONE}[key]
-            )):
-                with (
-                    patch.dict(
-                        os.environ,
-                        {
-                            "TG_API_ID": str(self.API_ID),
-                            "TG_API_HASH": self.API_HASH,
-                            "TG_PHONE": self.PHONE,
-                        },
-                        clear=True,
-                    ),
-                    patch.object(app_module, "_read_env_var", return_value=None),
-                    patch.object(app_module, "_telegram_session_is_authorized", return_value=True),
-                    patch.object(app_module, "bot_is_running", return_value=True),
-                    patch.object(app_module, "_telegram_auth") as manager,
-                    patch.object(app_module, "restart_telegram_worker") as restart,
-                ):
-                    response = self.client.post("/api/link_telegram", json=payload)
-
-                self.assertEqual(403, response.status_code)
-                self.assertEqual("already_linked", response.get_json()["error_code"])
-                manager.begin.assert_not_called()
-                restart.assert_not_called()
-                with self.client.session_transaction() as browser_session:
-                    self.assertFalse(browser_session.get("channel_admin"))
-
-    def test_persisted_credentials_recover_when_container_environment_is_stale(self):
-        payload = {
-            "api_id": self.API_ID,
-            "api_hash": self.API_HASH,
-            "phone": self.PHONE,
-        }
-        persisted = {
-            "TG_API_ID": "000" + str(self.API_ID),
-            "TG_API_HASH": self.API_HASH.upper(),
-            "TG_PHONE": self.PHONE,
-        }
-        stale_environment = {
-            "TG_API_ID": str(self.API_ID + 99),
-            "TG_API_HASH": "e" * 32,
-            "TG_PHONE": "+570000000099",
-        }
+    def test_linked_telegram_cannot_restart_from_an_unauthorized_browser(self):
+        with self.client.session_transaction() as browser_session:
+            browser_session.pop("channel_admin", None)
         with (
-            patch.dict(os.environ, stale_environment, clear=True),
-            patch.object(
-                app_module,
-                "_read_env_var",
-                side_effect=lambda key: persisted.get(key),
-            ),
             patch.object(app_module, "_telegram_session_is_authorized", return_value=True),
-            patch.object(app_module, "bot_is_running", return_value=True),
+            patch.object(app_module, "_valid_telegram_credentials") as validate,
+            patch.object(app_module, "bot_is_running") as running,
             patch.object(app_module, "_telegram_auth") as manager,
             patch.object(app_module, "restart_telegram_worker") as restart,
         ):
-            response = self.client.post("/api/link_telegram", json=payload)
+            response = self.client.post(
+                "/api/link_telegram",
+                json={"api_id": self.API_ID, "api_hash": self.API_HASH, "phone": self.PHONE},
+            )
 
-        self.assertEqual(200, response.status_code)
-        self.assertTrue(response.get_json()["already_authorized"])
+        self.assertEqual(403, response.status_code)
+        self.assertEqual("admin_required", response.get_json()["error_code"])
+        validate.assert_not_called()
+        running.assert_not_called()
         manager.begin.assert_not_called()
         restart.assert_not_called()
 
@@ -343,8 +306,7 @@ class TelegramRoutesTestCase(unittest.TestCase):
             "api_hash": self.API_HASH,
             "phone": self.PHONE,
         }
-        with self.client.session_transaction() as browser_session:
-            browser_session["channel_admin"] = True
+        self.authorize_browser()
         with (
             patch.object(app_module, "_telegram_session_is_authorized", return_value=True),
             patch.object(app_module, "bot_is_running", return_value=True),
@@ -358,23 +320,13 @@ class TelegramRoutesTestCase(unittest.TestCase):
         manager.begin.assert_not_called()
         restart.assert_not_called()
 
-    def test_linked_telegram_recovery_restarts_only_an_offline_worker(self):
+    def test_linked_admin_browser_can_restart_an_offline_worker(self):
         payload = {
             "api_id": self.API_ID,
             "api_hash": self.API_HASH,
             "phone": self.PHONE,
         }
         with (
-            patch.dict(
-                os.environ,
-                {
-                    "TG_API_ID": str(self.API_ID),
-                    "TG_API_HASH": self.API_HASH,
-                    "TG_PHONE": self.PHONE,
-                },
-                clear=True,
-            ),
-            patch.object(app_module, "_read_env_var", return_value=None),
             patch.object(app_module, "_telegram_session_is_authorized", return_value=True),
             patch.object(app_module, "bot_is_running", return_value=False),
             patch.object(app_module, "_telegram_auth") as manager,
@@ -384,6 +336,7 @@ class TelegramRoutesTestCase(unittest.TestCase):
                 return_value=(True, "Telegram iniciado"),
             ) as restart,
         ):
+            self.authorize_browser()
             response = self.client.post("/api/link_telegram", json=payload)
 
         self.assertEqual(200, response.status_code)

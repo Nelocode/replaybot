@@ -5,6 +5,7 @@ Flask webapp para gestionar mensajes y audios del bot.
 import os
 import json
 import hashlib
+import hmac
 import shutil
 import re
 import secrets
@@ -27,7 +28,11 @@ from flask import (
 )
 from telegram_auth import TelegramAuthManager
 from message_schema import load_message_file
-from panel_admin_access import PanelAdminAccessStore
+from operator_admin_recovery import (
+    OperatorAdminRecoveryGuard,
+    operator_key_matches,
+    valid_configured_operator_key,
+)
 from telegram_audio_branding import resolve_audio_branding, save_audio_branding_settings
 from test_mode import (
     interaction_state_summary,
@@ -56,6 +61,7 @@ WA_SWITCH_PID_FILE = WA_SWITCH_DIR / "worker.pid"
 WA_SWITCH_OPERATION_FILE = WA_SWITCH_DIR / "operation.json"
 WA_SWITCH_RECOVERY_ROOT = DATA_DIR / ".wa_switch_recovery"
 PANEL_ADMIN_ACCESS_DIR = DATA_DIR / "panel_admin_access"
+OPERATOR_ADMIN_ACCESS_DIR = PANEL_ADMIN_ACCESS_DIR / "operator"
 TG_AUDIO_BRANDING_DEFAULTS_FILE = BASE_DIR / "telegram_audio_branding.defaults.json"
 TG_AUDIO_BRANDING_SETTINGS_FILE = DATA_DIR / "telegram_audio_branding.json"
 TG_INTERACTION_STATE_FILE = DATA_DIR / "tg_interaction_state.json"
@@ -63,6 +69,8 @@ WA_INTERACTION_STATE_FILE = DATA_DIR / "wa_interaction_state.json"
 TEST_MODE_FILE = DATA_DIR / "test_mode.json"
 TEST_MODE_BACKUP_DIR = DATA_DIR / "test_mode_backups"
 WA_SWITCH_TIMEOUT_SECONDS = 180
+PANEL_ADMIN_RECOVERY_KEY_ENV = "PANEL_ADMIN_RECOVERY_KEY"
+OPERATOR_ADMIN_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
 
 def _load_or_create_flask_secret() -> str:
     configured = os.environ.get("FLASK_SECRET")
@@ -96,7 +104,10 @@ app.config.update(
     SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "1") != "0",
 )
 app.permanent_session_lifetime = timedelta(days=365)
-_panel_admin_access = PanelAdminAccessStore(PANEL_ADMIN_ACCESS_DIR, APP_SECRET)
+_operator_admin_recovery = OperatorAdminRecoveryGuard(
+    OPERATOR_ADMIN_ACCESS_DIR,
+    APP_SECRET,
+)
 
 # ── Telethon auth state (para flujo interactivo desde el panel) ──────
 # Conserva un solo event loop entre send_code_request, sign_in y 2FA.
@@ -214,24 +225,18 @@ label { color: #c8c8e0 !important; font-weight: 500; }
         <button id="tg-switch-open-btn" class="btn btn-sm btn-primary" onclick="showTelegramSwitch()">🔁 Cambiar cuenta</button>
       </div>
       <div id="admin-access" style="display:none;" class="p-3 mb-3 rounded border border-warning">
-        <h6 class="mb-1">🔐 Telegram sigue conectado</h6>
+        <h6 class="mb-1">🔐 Acceso administrativo</h6>
         <p class="small text-muted mb-2">
-          Verifica este navegador para administrar los canales. Enviaremos un código de un solo uso
-          a los Mensajes guardados de la cuenta de Telegram activa; la cuenta no se reiniciará ni cambiará.
+          Telegram puede estar vinculado a la cuenta del cliente. Para administrar los canales desde este
+          navegador, usa la clave privada del operador; no necesitas los datos ni el acceso a su Telegram.
         </p>
-        <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
-          <button id="admin-access-request-btn" class="btn btn-sm btn-primary" onclick="requestAdminAccess()">📨 Enviar código a Telegram</button>
-        </div>
-        <div id="admin-access-code-section" style="display:none;">
-          <label for="admin-access-code" class="small mb-1">Código de 8 dígitos</label>
-          <div class="d-flex flex-wrap gap-2">
-            <input id="admin-access-code" type="text" inputmode="numeric" autocomplete="one-time-code"
-                   pattern="[0-9]{8}" maxlength="8" class="form-control form-control-sm"
-                   placeholder="00000000" aria-describedby="admin-access-status"
-                   style="font-family:monospace;font-size:1.1rem;letter-spacing:4px;text-align:center;max-width:220px;">
-            <button id="admin-access-verify-btn" class="btn btn-sm btn-success" onclick="verifyAdminAccess()">✅ Verificar</button>
-            <button id="admin-access-cancel-btn" class="btn btn-sm btn-outline-light" onclick="cancelAdminAccess()">✕ Cancelar</button>
-          </div>
+        <label for="admin-operator-key" class="small mb-1">Clave administrativa</label>
+        <div class="d-flex flex-wrap gap-2">
+          <input id="admin-operator-key" type="password" autocomplete="off" maxlength="512"
+                 class="form-control form-control-sm" placeholder="Clave administrativa"
+                 aria-describedby="admin-access-status" style="max-width:440px;">
+          <button id="admin-access-recover-btn" class="btn btn-sm btn-primary"
+                  onclick="recoverOperatorAdminAccess()">🔓 Recuperar acceso</button>
         </div>
         <div id="admin-access-status" class="small text-muted mt-2" role="status" aria-live="polite"></div>
       </div>
@@ -454,12 +459,7 @@ let waSwitchGeneration = 0;
 let waSwitchPollAbortController = null;
 let waQrLoadGeneration = 0;
 let channelStateRequest = null;
-let adminAccessPollTimer = null;
-let adminAccessCountdownTimer = null;
-let adminAccessStatusRequest = null;
-let adminAccessPolling = false;
-let adminAccessExpiresAt = 0;
-let adminAccessRetryAt = 0;
+let adminRecoveryCooldownTimer = null;
 let tgAudioBrandingDirty = false;
 let testModeState = null;
 
@@ -968,56 +968,21 @@ function safeAccountLabel(account, fallback) {
 
 function guideChannelAdminRecovery() {
   document.getElementById("setup-modal").style.display = "block";
-  document.getElementById("admin-access").style.display = "none";
-  document.getElementById("tg-credentials-help").style.display = "block";
-  const status = document.getElementById("tg-link-status");
-  status.innerHTML = "🔐 Confirma el <strong>api_id, api_hash y teléfono actuales de Telegram</strong> para recuperar el acceso administrativo en este navegador.";
-  const form = document.getElementById("tg-initial-link");
-  form.style.display = "block";
-  const button = document.getElementById("tg-link-btn");
-  button.innerHTML = "🔐 Recuperar acceso";
+  const telegram = channelState && channelState.telegram ? channelState.telegram : {};
+  document.getElementById("tg-credentials-help").style.display = "none";
+  document.getElementById("tg-initial-link").style.display = "none";
+  document.getElementById("tg-linked-actions").style.display = "none";
+  const panel = document.getElementById("admin-access");
+  panel.style.display = "block";
+  document.getElementById("tg-link-status").innerHTML =
+    telegram.linked
+      ? "🔐 Telegram sigue conectado. Usa la <strong>clave administrativa</strong> del operador para habilitar este navegador."
+      : "🔐 Usa la <strong>clave administrativa</strong> del operador antes de configurar Telegram.";
   requestAnimationFrame(() => {
-    form.scrollIntoView({behavior: "smooth", block: "center"});
-    document.getElementById("tg-api-id").focus();
+    panel.scrollIntoView({behavior: "smooth", block: "center"});
+    document.getElementById("admin-operator-key").focus();
   });
-  toast("🔐 Recupera primero el acceso del panel con la cuenta actual de Telegram", "error");
-}
-
-function adminAccessState(data) {
-  if (!data || typeof data !== "object") return "idle";
-  const raw = String(data.state || data.status || data.error_code || "");
-  const aliases = {
-    sent: "delivered",
-    delivery_retrying: "queued",
-    no_active_challenge: "missing",
-    expired_code: "expired",
-    attempts_exhausted: "locked"
-  };
-  if (aliases[raw]) return aliases[raw];
-  if (raw) return raw;
-  if (data.delivered) return "delivered";
-  if (data.pending) return "pending";
-  return "idle";
-}
-
-function adminAccessDeadline(data, absoluteKey, relativeKeys) {
-  const absolute = data && data[absoluteKey];
-  if (typeof absolute === "number" && Number.isFinite(absolute)) {
-    return absolute > 1000000000000 ? absolute : absolute * 1000;
-  }
-  if (typeof absolute === "string") {
-    const parsed = Date.parse(absolute);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  for (const key of relativeKeys) {
-    const seconds = Number(data && data[key]);
-    if (Number.isFinite(seconds) && seconds > 0) return Date.now() + seconds * 1000;
-  }
-  return 0;
-}
-
-function adminAccessSeconds(deadline) {
-  return deadline ? Math.max(0, Math.ceil((deadline - Date.now()) / 1000)) : 0;
+  toast("🔐 Introduce la clave administrativa del operador", "error");
 }
 
 function setAdminAccessStatus(message, type="muted") {
@@ -1026,271 +991,81 @@ function setAdminAccessStatus(message, type="muted") {
   status.textContent = message;
 }
 
-function updateAdminAccessCountdown() {
-  const requestButton = document.getElementById("admin-access-request-btn");
-  const state = document.getElementById("admin-access").dataset.state || "idle";
-  const expires = adminAccessSeconds(adminAccessExpiresAt);
-  const retry = adminAccessSeconds(adminAccessRetryAt);
-  requestButton.disabled = retry > 0 || ["pending", "queued", "delivered", "awaiting_code"].includes(state);
-  requestButton.textContent = retry > 0
-    ? `Espera ${retry}s para reenviar`
-    : "📨 Enviar código a Telegram";
-  if (["pending", "queued"].includes(state)) {
-    setAdminAccessStatus(
-      expires > 0
-        ? `Preparando el código para Telegram. Expira en ${expires}s.`
-        : "Preparando el código para Telegram…"
-    );
-  } else if (["delivered", "awaiting_code"].includes(state)) {
-    setAdminAccessStatus(
-      expires > 0
-        ? `Código enviado a Mensajes guardados. Expira en ${expires}s.`
-        : "Código enviado a Mensajes guardados."
-    );
-  }
-  if (adminAccessExpiresAt && expires === 0 && ["pending", "queued", "delivered", "awaiting_code"].includes(state)) {
-    document.getElementById("admin-access").dataset.state = "expired";
-    document.getElementById("admin-access-code-section").style.display = "none";
-    requestButton.disabled = retry > 0;
-    setAdminAccessStatus("El código venció. Solicita uno nuevo.", "error");
-    stopAdminAccessPolling();
-  }
-  if (!expires && !retry && adminAccessCountdownTimer) {
-    clearInterval(adminAccessCountdownTimer);
-    adminAccessCountdownTimer = null;
-  }
-}
-
-function startAdminAccessCountdown() {
-  if (!adminAccessCountdownTimer) {
-    adminAccessCountdownTimer = setInterval(updateAdminAccessCountdown, 1000);
-  }
-  updateAdminAccessCountdown();
-}
-
-function renderAdminAccessState(data) {
-  if (!data || typeof data !== "object") return;
-  if (data.csrf) channelCsrf = data.csrf;
-  const state = adminAccessState(data);
-  const panel = document.getElementById("admin-access");
-  const codeSection = document.getElementById("admin-access-code-section");
-  panel.dataset.state = state;
-  adminAccessExpiresAt = adminAccessDeadline(data, "expires_at", ["expires_in", "expires_seconds", "ttl"])
-    || adminAccessExpiresAt;
-  adminAccessRetryAt = adminAccessDeadline(data, "retry_at", ["retry_after"])
-    || adminAccessRetryAt;
-
-  if (["pending", "queued", "delivered", "awaiting_code"].includes(state)) {
-    codeSection.style.display = "block";
-    startAdminAccessCountdown();
-    if (["pending", "queued"].includes(state)) beginAdminAccessPolling();
-    else stopAdminAccessPolling();
-  } else if (state === "verified") {
-    adminAccessExpiresAt = 0;
-    codeSection.style.display = "none";
-    setAdminAccessStatus("Este navegador ya está verificado.", "success");
-    stopAdminAccessPolling();
-    loadChannelState(true);
-  } else if (state === "expired") {
-    adminAccessExpiresAt = 0;
-    codeSection.style.display = "none";
-    setAdminAccessStatus("El código venció. Solicita uno nuevo.", "error");
-    stopAdminAccessPolling();
-  } else if (state === "locked") {
-    adminAccessExpiresAt = 0;
-    codeSection.style.display = "none";
-    setAdminAccessStatus("Se agotaron los intentos. Espera antes de solicitar otro código.", "error");
-    stopAdminAccessPolling();
-  } else if (state === "delivery_failed") {
-    adminAccessExpiresAt = 0;
-    codeSection.style.display = "none";
-    setAdminAccessStatus("Telegram no pudo entregar el código. Reintenta cuando el servicio esté disponible.", "error");
-    stopAdminAccessPolling();
-  } else if (["cancelled", "canceled", "idle", "missing"].includes(state)) {
-    adminAccessExpiresAt = 0;
-    codeSection.style.display = "none";
-    setAdminAccessStatus(
-      ["cancelled", "canceled"].includes(state)
-        ? "Verificación cancelada."
-        : "Solicita un código para verificar este navegador. Telegram sigue conectado."
-    );
-    stopAdminAccessPolling();
-  }
-  startAdminAccessCountdown();
-}
-
-function stopAdminAccessPolling() {
-  adminAccessPolling = false;
-  if (adminAccessPollTimer) clearTimeout(adminAccessPollTimer);
-  adminAccessPollTimer = null;
-}
-
-function beginAdminAccessPolling() {
-  if (adminAccessPolling) return;
-  adminAccessPolling = true;
-  const poll = async () => {
-    if (!adminAccessPolling) return;
-    const data = await loadAdminAccessStatus();
-    const state = adminAccessState(data);
-    if (["pending", "queued"].includes(state)) {
-      adminAccessPollTimer = setTimeout(poll, 2000);
-    } else {
-      stopAdminAccessPolling();
+function setAdminRecoveryCooldown(retryAfter) {
+  if (adminRecoveryCooldownTimer) clearInterval(adminRecoveryCooldownTimer);
+  let remaining = Math.max(1, Number.parseInt(retryAfter, 10) || 1);
+  const button = document.getElementById("admin-access-recover-btn");
+  const update = () => {
+    button.disabled = remaining > 0;
+    button.textContent = remaining > 0
+      ? `Espera ${remaining}s`
+      : "🔓 Recuperar acceso";
+    if (remaining <= 0) {
+      clearInterval(adminRecoveryCooldownTimer);
+      adminRecoveryCooldownTimer = null;
+      return;
     }
+    remaining -= 1;
   };
-  adminAccessPollTimer = setTimeout(poll, 1000);
+  update();
+  adminRecoveryCooldownTimer = setInterval(update, 1000);
 }
 
-async function loadAdminAccessStatus() {
-  if (adminAccessStatusRequest) return adminAccessStatusRequest;
-  adminAccessStatusRequest = (async () => {
-    try {
-      const response = await fetch("/api/admin_access/status", {cache: "no-store"});
-      const data = await response.json();
-      renderAdminAccessState(data);
-      return data;
-    } catch(error) {
-      setAdminAccessStatus("No fue posible consultar la verificación. Intenta nuevamente.", "error");
-      return null;
-    } finally {
-      adminAccessStatusRequest = null;
-    }
-  })();
-  return adminAccessStatusRequest;
-}
-
-function openAdminAccessVerification() {
-  document.getElementById("setup-modal").style.display = "block";
-  const telegram = channelState && channelState.telegram ? channelState.telegram : {};
-  if (telegram.linked === false) {
-    document.getElementById("admin-access").style.display = "none";
-    document.getElementById("tg-credentials-help").style.display = "block";
-    document.getElementById("tg-initial-link").style.display = "block";
-    setTimeout(() => document.getElementById("tg-api-id").focus(), 0);
-    toast("Vincula Telegram antes de administrar WhatsApp.", "error");
-    return;
-  }
-  const panel = document.getElementById("admin-access");
-  document.getElementById("tg-credentials-help").style.display = "none";
-  document.getElementById("tg-initial-link").style.display = "none";
-  document.getElementById("tg-linked-actions").style.display = "none";
-  panel.style.display = "block";
-  if (!panel.dataset.state || panel.dataset.state === "idle") {
-    setAdminAccessStatus("Solicita un código para verificar este navegador. Telegram sigue conectado.");
-  }
-  requestAnimationFrame(() => {
-    panel.scrollIntoView({behavior: "smooth", block: "center"});
-    document.getElementById("admin-access-request-btn").focus();
-  });
-  loadAdminAccessStatus();
-  toast("Telegram sigue conectado. Verifica este navegador para administrar WhatsApp.", "error");
-}
-
-async function requestAdminAccess() {
-  const button = document.getElementById("admin-access-request-btn");
-  button.disabled = true;
-  setAdminAccessStatus("Solicitando un código de un solo uso…");
-  try {
-    const response = await fetch("/api/admin_access/request", {
-      method: "POST",
-      headers: channelHeaders(),
-      body: "{}"
-    });
-    const data = await response.json();
-    if (data.csrf) channelCsrf = data.csrf;
-    if (!response.ok || data.ok === false) {
-      renderAdminAccessState(data);
-      throw new Error(data.error || "No fue posible enviar el código");
-    }
-    if (data.authorized || adminAccessState(data) === "verified") {
-      channelCsrf = data.csrf || null;
-      await loadChannelState(true);
-      toast("✅ Este navegador ya está verificado", "success");
-      return;
-    }
-    const state = adminAccessState(data);
-    renderAdminAccessState(data);
-    if (!["pending", "queued", "delivered", "awaiting_code"].includes(state)) {
-      updateAdminAccessCountdown();
-      return;
-    }
-    document.getElementById("admin-access-code-section").style.display = "block";
-    document.getElementById("admin-access-code").value = "";
-    document.getElementById("admin-access-code").focus();
-    toast(
-      ["delivered", "awaiting_code"].includes(state)
-        ? "Código disponible en Mensajes guardados de Telegram."
-        : "Solicitud enviada. Espera la confirmación de entrega en Telegram.",
-      "success"
-    );
-  } catch(error) {
-    setAdminAccessStatus(error.message, "error");
-    updateAdminAccessCountdown();
-  }
-}
-
-async function verifyAdminAccess() {
-  const input = document.getElementById("admin-access-code");
-  const code = input.value.trim();
-  if (!/^\d{8}$/.test(code)) {
-    setAdminAccessStatus("Ingresa exactamente los 8 dígitos del código.", "error");
+async function recoverOperatorAdminAccess() {
+  const input = document.getElementById("admin-operator-key");
+  const button = document.getElementById("admin-access-recover-btn");
+  const key = input.value;
+  if (!key) {
+    setAdminAccessStatus("Ingresa la clave administrativa.", "error");
     input.focus();
     return;
   }
-  const button = document.getElementById("admin-access-verify-btn");
-  button.disabled = true;
-  input.value = "";
-  setAdminAccessStatus("Verificando este navegador…");
-  try {
-    const response = await fetch("/api/admin_access/verify", {
-      method: "POST",
-      headers: channelHeaders(),
-      body: JSON.stringify({code})
-    });
-    const data = await response.json();
-    if (!response.ok || data.ok === false) {
-      renderAdminAccessState(data);
-      throw new Error(data.error || "El código no es válido");
-    }
-    stopAdminAccessPolling();
-    channelCsrf = data.csrf || null;
-    setAdminAccessStatus("Navegador verificado. Ya puedes administrar WhatsApp.", "success");
-    toast("✅ Navegador verificado", "success");
-    const latest = await loadChannelState(true);
-    if (latest && latest.csrf) channelCsrf = latest.csrf;
-    requestAnimationFrame(() => document.getElementById("wa-switch-btn").scrollIntoView({behavior: "smooth", block: "center"}));
-  } catch(error) {
-    button.disabled = false;
-    setAdminAccessStatus(error.message, "error");
-    input.focus();
-  }
-}
 
-async function cancelAdminAccess() {
-  stopAdminAccessPolling();
+  button.disabled = true;
+  button.textContent = "⏳ Comprobando…";
+  setAdminAccessStatus("Comprobando la clave administrativa…");
   try {
-    const response = await fetch("/api/admin_access/cancel", {
+    const response = await fetch("/api/admin_access/operator", {
       method: "POST",
       headers: channelHeaders(),
-      body: "{}"
+      body: JSON.stringify({key})
     });
     const data = await response.json();
-    if (!response.ok && response.status !== 404) throw new Error(data.error || "No fue posible cancelar");
     if (data.csrf) channelCsrf = data.csrf;
-    document.getElementById("admin-access").dataset.state = "cancelled";
-    adminAccessExpiresAt = 0;
-    adminAccessRetryAt = 0;
-    if (adminAccessCountdownTimer) clearInterval(adminAccessCountdownTimer);
-    adminAccessCountdownTimer = null;
-    document.getElementById("admin-access-code").value = "";
-    document.getElementById("admin-access-code-section").style.display = "none";
-    document.getElementById("admin-access-request-btn").disabled = false;
-    document.getElementById("admin-access-request-btn").textContent = "📨 Enviar código a Telegram";
-    setAdminAccessStatus("Verificación cancelada.");
+    input.value = "";
+
+    if (response.ok && data.ok && data.authorized) {
+      setAdminAccessStatus("Acceso recuperado. Ya puedes administrar los canales.", "success");
+      toast("✅ Acceso administrativo recuperado", "success");
+      const latest = await loadChannelState(true);
+      if (latest && latest.csrf) channelCsrf = latest.csrf;
+      return;
+    }
+
+    if (data.error_code === "operator_recovery_unconfigured") {
+      setAdminAccessStatus(
+        "La clave administrativa todavía no está configurada. Pide al operador del sistema que la configure.",
+        "error"
+      );
+    } else if (data.error_code === "invalid_operator_key") {
+      setAdminAccessStatus("La clave administrativa no es correcta.", "error");
+    } else if (data.error_code === "rate_limited" || response.status === 429) {
+      setAdminAccessStatus("Hay demasiados intentos. Espera antes de volver a probar.", "error");
+      setAdminRecoveryCooldown(data.retry_after);
+      input.focus();
+      return;
+    } else if (data.error_code === "csrf_invalid") {
+      setAdminAccessStatus("La sesión del panel venció. Actualiza la página e inténtalo nuevamente.", "error");
+    } else {
+      setAdminAccessStatus(data.error || "No fue posible recuperar el acceso.", "error");
+    }
   } catch(error) {
-    setAdminAccessStatus(error.message, "error");
+    input.value = "";
+    setAdminAccessStatus("No fue posible comprobar la clave. Revisa la conexión e inténtalo nuevamente.", "error");
   }
-  await loadChannelState(true);
+  button.disabled = false;
+  button.textContent = "🔓 Recuperar acceso";
+  input.focus();
 }
 
 function revealWaQrCard(resetImage=false) {
@@ -1346,15 +1121,18 @@ function renderChannelState(data) {
   const tgSwitchOpen = document.getElementById("tg-switch-open-btn");
   const tgLinkButton = document.getElementById("tg-link-btn");
   tgSwitchOpen.disabled = !data.can_manage || tg.state === "recovery_required";
+  adminAccess.style.display = data.can_manage ? "none" : "block";
+  if (data.can_manage) {
+    document.getElementById("admin-operator-key").value = "";
+    setAdminAccessStatus("");
+  } else if (!document.getElementById("admin-access-status").textContent.trim()) {
+    setAdminAccessStatus("Introduce la clave administrativa entregada al operador.");
+  }
   if (tg.linked) {
-    tgCredentialsHelp.style.display = data.can_manage ? "none" : "block";
-    tgInitial.style.display = data.can_manage ? "none" : "block";
+    tgCredentialsHelp.style.display = "none";
+    tgInitial.style.display = "none";
     tgLinked.style.display = data.can_manage ? "block" : "none";
-    adminAccess.style.display = "none";
-    stopAdminAccessPolling();
-    document.getElementById("admin-access-code").value = "";
-    document.getElementById("admin-access-code-section").style.display = "none";
-    tgLinkButton.innerHTML = data.can_manage ? "🔗 Vincular" : "🔐 Recuperar acceso";
+    tgLinkButton.innerHTML = "🔗 Vincular";
     tgSummary.textContent = "Cuenta actual: " + safeAccountLabel(tg, "Telegram vinculado");
     document.getElementById("tg-link-status").innerHTML = data.can_manage
       ? (tg.state === "recovery_required"
@@ -1362,16 +1140,15 @@ function renderChannelState(data) {
           : tg.ready
           ? "✅ <strong>Vinculado y en línea.</strong>"
           : "⚠️ <strong>Cuenta vinculada, servicio fuera de línea.</strong>")
-      : "🔐 Para administrar desde este navegador, confirma abajo el api_id, api_hash y teléfono actuales.";
+      : "🔐 Telegram sigue conectado. Usa abajo la <strong>clave administrativa</strong> del operador.";
   } else {
-    tgCredentialsHelp.style.display = "block";
-    tgInitial.style.display = "block";
+    tgCredentialsHelp.style.display = data.can_manage ? "block" : "none";
+    tgInitial.style.display = data.can_manage ? "block" : "none";
     tgLinked.style.display = "none";
-    adminAccess.style.display = "none";
-    stopAdminAccessPolling();
     tgLinkButton.innerHTML = "🔗 Vincular";
-    document.getElementById("tg-link-status").innerHTML =
-      "⚠️ Sin vincular. Ingresa api_id, api_hash y teléfono una sola vez.";
+    document.getElementById("tg-link-status").innerHTML = data.can_manage
+      ? "⚠️ Sin vincular. Ingresa api_id, api_hash y teléfono una sola vez."
+      : "🔐 Usa la <strong>clave administrativa</strong> del operador antes de configurar Telegram.";
   }
 
   const wa = data.whatsapp || {};
@@ -1398,10 +1175,10 @@ function renderChannelState(data) {
     ? "Cuenta actual: " + safeAccountLabel(wa, "WhatsApp vinculado")
     : (data.can_manage
         ? "Todavía no hay una cuenta vinculada."
-        : "Vincula Telegram primero para habilitar la administración segura.");
+        : "Usa la clave administrativa para habilitar este navegador.");
   if (!data.can_manage) {
     document.getElementById("wa-link-status").innerHTML =
-      "🔐 Para administrar WhatsApp o generar un QR, pulsa <strong>Recuperar acceso</strong> y confirma arriba las credenciales actuales de Telegram.";
+      "🔐 Para administrar WhatsApp o generar un QR, usa arriba la <strong>clave administrativa</strong> del operador.";
   } else if (wa.state === "recovery_required") {
     document.getElementById("wa-link-status").innerHTML =
       "❌ El cambio requiere recuperación manual. El respaldo se mantiene protegido.";
@@ -2062,7 +1839,7 @@ function renderTestModeState(data) {
     button.disabled = !canManage || !enabled;
   });
   if (!canManage) {
-    summary.textContent = "Verifica este navegador con Telegram para consultar y administrar las pruebas.";
+    summary.textContent = "Usa la clave administrativa del operador para consultar y administrar las pruebas.";
     return;
   }
   const tgCount = data?.telegram?.conversation_count ?? 0;
@@ -2146,8 +1923,11 @@ async function resetTestConversation(channel) {
   }
 }
 
-document.getElementById("admin-access-code").addEventListener("input", event => {
-  event.target.value = event.target.value.replace(/\D/g, "").slice(0, 8);
+document.getElementById("admin-operator-key").addEventListener("keydown", event => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    recoverOperatorAdminAccess();
+  }
 });
 
 // Auto-refresh cada 10 segundos
@@ -2214,6 +1994,35 @@ def _read_env_var(key: str) -> str | None:
     return None
 
 
+def _configured_operator_recovery_key() -> str | None:
+    """Load the operator-owned key only from the deployment environment."""
+
+    configured = os.environ.get(PANEL_ADMIN_RECOVERY_KEY_ENV)
+    return configured if valid_configured_operator_key(configured) else None
+
+
+def _operator_recovery_key_version(configured_key: str) -> str | None:
+    """Derive a server-keyed version that revokes sessions when the key rotates."""
+
+    if not valid_configured_operator_key(configured_key):
+        return None
+    return hmac.new(
+        APP_SECRET.encode("utf-8"),
+        b"panel-operator-session:v1\0" + configured_key.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _channel_worker_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Build a worker environment that cannot inherit the panel operator key."""
+
+    worker_env = os.environ.copy()
+    worker_env.pop(PANEL_ADMIN_RECOVERY_KEY_ENV, None)
+    if extra:
+        worker_env.update(extra)
+    return worker_env
+
+
 def _mask_phone(phone: str | None) -> str | None:
     digits = re.sub(r"\D", "", phone or "")
     return f"••••{digits[-4:]}" if len(digits) >= 4 else None
@@ -2269,32 +2078,49 @@ def _channel_csrf_token() -> str:
     return token
 
 
-def _admin_access_browser_token(*, create: bool = False) -> str | None:
-    """Identificador opaco que liga un reto al navegador que lo solicitó."""
+def _operator_recovery_identity() -> str:
+    """Build an ephemeral client identity; only its keyed digest is persisted."""
 
-    token = session.get("admin_access_browser")
-    if isinstance(token, str) and len(token) >= 32:
-        return token
-    if not create:
-        return None
-    token = secrets.token_urlsafe(32)
-    session["admin_access_browser"] = token
-    session.permanent = True
-    return token
+    token = session.get("operator_recovery_browser")
+    if not isinstance(token, str) or len(token) < 32:
+        token = secrets.token_urlsafe(32)
+        session["operator_recovery_browser"] = token
+        session.permanent = True
+    return token + "\0" + str(request.remote_addr or "unknown")
 
 
 def _can_manage_channels() -> bool:
-    if session.get("channel_admin"):
+    if not session.get("channel_admin"):
+        return False
+
+    configured_key = _configured_operator_recovery_key()
+    expected_version = (
+        _operator_recovery_key_version(configured_key)
+        if configured_key is not None
+        else None
+    )
+    supplied_version = session.get("operator_recovery_key_version")
+    verified_at = session.get("operator_recovery_verified_at")
+    try:
+        session_age = time.time() - float(verified_at)
+    except (TypeError, ValueError):
+        session_age = OPERATOR_ADMIN_SESSION_TTL_SECONDS + 1
+
+    authorized = bool(
+        expected_version
+        and isinstance(supplied_version, str)
+        and secrets.compare_digest(expected_version, supplied_version)
+        and -300 <= session_age <= OPERATOR_ADMIN_SESSION_TTL_SECONDS
+    )
+    if authorized:
         return True
-    # Migra una sesión administrativa legítima creada por una versión anterior.
-    if session.get("telegram_admin") or session.get("wa_admin"):
-        session["channel_admin"] = True
-        session.pop("telegram_admin", None)
-        session.pop("wa_admin", None)
-        return True
+
+    session.pop("channel_admin", None)
+    session.pop("operator_recovery_key_version", None)
+    session.pop("operator_recovery_verified_at", None)
+    session.pop("telegram_admin", None)
+    session.pop("wa_admin", None)
     return False
-
-
 def _channel_csrf_error():
     supplied = request.headers.get("X-Channel-CSRF", "")
     expected = _channel_csrf_token()
@@ -2312,7 +2138,7 @@ def _channel_mutation_error():
         return jsonify({
             "ok": False,
             "error_code": "admin_required",
-            "error": "Abre el panel desde el navegador que vinculó los canales.",
+            "error": "Usa la clave administrativa del operador para habilitar este navegador.",
         }), 403
     return _channel_csrf_error()
 
@@ -2321,10 +2147,7 @@ _PANEL_CSRF_ONLY_MUTATIONS = frozenset({
     "/api/admin_access/request",
     "/api/admin_access/verify",
     "/api/admin_access/cancel",
-    "/api/link_telegram",
-    "/api/verify_telegram_code",
-    "/api/verify_telegram_password",
-    "/api/cancel_telegram_auth",
+    "/api/admin_access/operator",
 })
 
 
@@ -2364,45 +2187,6 @@ def _valid_telegram_credentials(api_id, api_hash: str, phone: str) -> bool:
         and re.fullmatch(r"[0-9a-fA-F]{32}", api_hash or "")
         and re.fullmatch(r"\+[0-9]{7,15}", phone or "")
     )
-
-
-def _telegram_credentials_match_saved(api_id, api_hash: str, phone: str) -> bool:
-    """Recupera este navegador sólo si confirma la cuenta TG ya vinculada."""
-
-    candidates = (
-        (
-            os.environ.get("TG_API_ID") or "",
-            os.environ.get("TG_API_HASH") or "",
-            os.environ.get("TG_PHONE") or "",
-        ),
-        (
-            _read_env_var("TG_API_ID") or "",
-            _read_env_var("TG_API_HASH") or "",
-            _read_env_var("TG_PHONE") or "",
-        ),
-    )
-    try:
-        normalized_api_id = str(int(api_id))
-    except (TypeError, ValueError):
-        return False
-    normalized_api_hash = api_hash.strip().lower()
-    for saved_id_raw, saved_hash_raw, saved_phone_raw in candidates:
-        try:
-            saved_id = str(int(str(saved_id_raw).strip()))
-        except (TypeError, ValueError):
-            continue
-        saved_hash = str(saved_hash_raw).strip().lower()
-        saved_phone_text = str(saved_phone_raw).strip()
-        saved_phone = _normalize_telegram_phone(saved_phone_text) or saved_phone_text
-        if not saved_id or not saved_hash or not saved_phone:
-            continue
-        if (
-            secrets.compare_digest(normalized_api_id, saved_id)
-            and secrets.compare_digest(normalized_api_hash, saved_hash)
-            and secrets.compare_digest(phone, saved_phone)
-        ):
-            return True
-    return False
 
 
 def _save_telegram_creds(api_id, api_hash, phone):
@@ -2588,8 +2372,11 @@ def restart_telegram_worker() -> tuple[bool, str]:
     if sys.platform == "win32" and str(log_path).startswith("/tmp/"):
         log_path = DATA_DIR / "bot_tg.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    env = os.environ.copy()
-    env.update({"TG_API_ID": str(api_id), "TG_API_HASH": api_hash, "TG_PHONE": phone})
+    env = _channel_worker_environment({
+        "TG_API_ID": str(api_id),
+        "TG_API_HASH": api_hash,
+        "TG_PHONE": phone,
+    })
 
     kwargs = {"cwd": str(BASE_DIR), "env": env, "start_new_session": True}
     if sys.platform == "win32":
@@ -3433,68 +3220,29 @@ def api_tg_status():
     })
 
 
-def _admin_access_response_status(result: dict) -> int:
-    error_code = result.get("error_code")
-    return {
-        "invalid_browser_token": 400,
-        "invalid_code": 400,
-        "not_delivered": 409,
-        "request_in_progress": 409,
-        "no_active_challenge": 404,
-        "expired_code": 410,
-        "attempts_exhausted": 429,
-        "rate_limited": 429,
-        "busy": 503,
-        "storage_error": 503,
-        "delivery_failed": 503,
-    }.get(error_code, 200 if result.get("ok") else 400)
-
-
 @app.route("/api/admin_access/request", methods=["POST"])
 def api_admin_access_request():
-    """Envía un OTP por la cuenta TG ya activa, sin pedir credenciales MTProto."""
+    """Legacy OTP entry point retained as an inert, fail-closed stub."""
 
     csrf_error = _channel_csrf_error()
     if csrf_error:
         return csrf_error
-    if _can_manage_channels():
-        return jsonify({
-            "ok": True,
-            "authorized": True,
-            "state": "verified",
-            "csrf": _channel_csrf_token(),
-        })
-    if not _telegram_session_is_authorized():
-        return jsonify({
-            "ok": False,
-            "error_code": "telegram_not_linked",
-            "error": "Telegram todavía no está vinculado.",
-        }), 409
-
-    if not bot_is_running():
-        return jsonify({
-            "ok": False,
-            "error_code": "telegram_offline",
-            "error": "Telegram está vinculado, pero el servicio de entrega está fuera de línea.",
-        }), 503
-
-    browser_token = _admin_access_browser_token(create=True)
-    result = _panel_admin_access.create_challenge(browser_token)
-    return jsonify(result), _admin_access_response_status(result)
+    return jsonify({
+        "ok": False,
+        "authorized": False,
+        "error_code": "operator_recovery_required",
+        "error": "La recuperación por Telegram fue deshabilitada. Usa la clave administrativa del operador.",
+    }), 410
 
 
 @app.route("/api/admin_access/status")
 def api_admin_access_status():
-    if _can_manage_channels():
-        return jsonify({
-            "ok": True,
-            "authorized": True,
-            "state": "verified",
-            "csrf": _channel_csrf_token(),
-        })
-    browser_token = _admin_access_browser_token()
-    result = _panel_admin_access.get_status(browser_token or "")
-    return jsonify(result), _admin_access_response_status(result)
+    return jsonify({
+        "ok": False,
+        "authorized": False,
+        "error_code": "operator_recovery_required",
+        "error": "La recuperación por Telegram fue deshabilitada. Usa la clave administrativa del operador.",
+    }), 410
 
 
 @app.route("/api/admin_access/verify", methods=["POST"])
@@ -3502,19 +3250,12 @@ def api_admin_access_verify():
     csrf_error = _channel_csrf_error()
     if csrf_error:
         return csrf_error
-    data = request.get_json(silent=True) or {}
-    code = data.get("code") if isinstance(data.get("code"), str) else ""
-    browser_token = _admin_access_browser_token()
-    result = _panel_admin_access.verify(browser_token or "", code.strip())
-    if result.get("authorized"):
-        session["channel_admin"] = True
-        session.pop("telegram_admin", None)
-        session.pop("wa_admin", None)
-        session["admin_access_browser"] = secrets.token_urlsafe(32)
-        session["channel_csrf"] = secrets.token_urlsafe(32)
-        session.permanent = True
-        result["csrf"] = session["channel_csrf"]
-    return jsonify(result), _admin_access_response_status(result)
+    return jsonify({
+        "ok": False,
+        "authorized": False,
+        "error_code": "operator_recovery_required",
+        "error": "La recuperación por Telegram fue deshabilitada. Usa la clave administrativa del operador.",
+    }), 410
 
 
 @app.route("/api/admin_access/cancel", methods=["POST"])
@@ -3522,9 +3263,83 @@ def api_admin_access_cancel():
     csrf_error = _channel_csrf_error()
     if csrf_error:
         return csrf_error
-    browser_token = _admin_access_browser_token()
-    result = _panel_admin_access.cancel(browser_token or "")
-    return jsonify(result), _admin_access_response_status(result)
+    return jsonify({
+        "ok": False,
+        "authorized": False,
+        "error_code": "operator_recovery_required",
+        "error": "La recuperación por Telegram fue deshabilitada. Usa la clave administrativa del operador.",
+    }), 410
+
+
+@app.route("/api/admin_access/operator", methods=["POST"])
+def api_admin_access_operator():
+    """Authorize this browser with an operator-owned key, independently of channels."""
+
+    csrf_error = _channel_csrf_error()
+    if csrf_error:
+        return csrf_error
+
+    configured_key = _configured_operator_recovery_key()
+    if configured_key is None:
+        return jsonify({
+            "ok": False,
+            "authorized": False,
+            "error_code": "operator_recovery_unconfigured",
+            "error": "La clave administrativa del operador no está configurada.",
+        }), 503
+
+    data = request.get_json(silent=True) or {}
+    supplied_key = data.get("key") if isinstance(data.get("key"), str) else ""
+    matched = operator_key_matches(configured_key, supplied_key)
+    decision = _operator_admin_recovery.evaluate(
+        _operator_recovery_identity(),
+        matched=matched,
+    )
+    if not decision.get("allowed"):
+        error_code = decision.get("error_code")
+        if error_code == "rate_limited":
+            retry_after = max(1, int(decision.get("retry_after", 1) or 1))
+            response = jsonify({
+                "ok": False,
+                "authorized": False,
+                "error_code": "rate_limited",
+                "retry_after": retry_after,
+                "error": "Hay demasiados intentos. Espera antes de volver a probar.",
+            })
+            response.status_code = 429
+            response.headers["Retry-After"] = str(retry_after)
+            return response
+        if error_code in {"busy", "invalid_client"}:
+            return jsonify({
+                "ok": False,
+                "authorized": False,
+                "error_code": "operator_recovery_unavailable",
+                "retry_after": max(1, int(decision.get("retry_after", 1) or 1)),
+                "error": "No fue posible comprobar la clave en este momento.",
+            }), 503
+        return jsonify({
+            "ok": False,
+            "authorized": False,
+            "error_code": "invalid_operator_key",
+            "error": "La clave administrativa no es correcta.",
+        }), 401
+
+    session["channel_admin"] = True
+    session.pop("telegram_admin", None)
+    session.pop("wa_admin", None)
+    session["operator_recovery_key_version"] = _operator_recovery_key_version(
+        configured_key
+    )
+    session["operator_recovery_verified_at"] = time.time()
+    session["operator_recovery_browser"] = secrets.token_urlsafe(32)
+    session["channel_csrf"] = secrets.token_urlsafe(32)
+    session.permanent = True
+    return jsonify({
+        "ok": True,
+        "authorized": True,
+        "state": "verified",
+        "csrf": session["channel_csrf"],
+    })
 
 
 def _finish_telegram_auth(outcome):
@@ -3592,6 +3407,31 @@ def _finish_telegram_switch(outcome):
 def api_link_telegram():
     """Inicia una autorización y describe el canal elegido por Telegram."""
     data = request.get_json(silent=True) or {}
+
+    # Una sesión TG existente nunca sirve para autenticar este navegador. La
+    # clave del operador es el único flujo de recuperación administrativa y no
+    # depende de credenciales ni de acceso a la cuenta del cliente final.
+    if _telegram_session_is_authorized():
+        if not _can_manage_channels():
+            return jsonify({
+                "ok": False,
+                "authorized": False,
+                "error_code": "operator_recovery_required",
+                "error": "Telegram ya está vinculado. Usa la clave administrativa del operador.",
+            }), 403
+        if bot_is_running():
+            started, message = True, "Telegram ya está vinculado y en línea."
+        else:
+            started, message = restart_telegram_worker()
+        return jsonify({
+            "ok": started,
+            "already_authorized": True,
+            "worker_starting": started,
+            "message": message,
+            "csrf": _channel_csrf_token(),
+            **({} if started else {"error": message}),
+        })
+
     api_id = data.get("api_id")
     api_hash = (data.get("api_hash") or "").strip()
     phone = _normalize_telegram_phone(data.get("phone") or "")
@@ -3602,33 +3442,6 @@ def api_link_telegram():
             "error_code": "invalid_input",
             "error": "Revisa api_id, api_hash y el teléfono en formato internacional.",
         }), 400
-
-    # Recuperación por credenciales: una cuenta ya vinculada no se reemplaza.
-    # Las credenciales sólo confirman que este navegador administra esa misma
-    # cuenta; nunca se guardan de nuevo ni se solicita otro código de Telegram.
-    if _telegram_session_is_authorized():
-        if not _can_manage_channels():
-            if not _telegram_credentials_match_saved(api_id, api_hash, phone):
-                return jsonify({
-                    "ok": False,
-                    "error_code": "already_linked",
-                    "error": "Telegram ya está vinculado y las credenciales no coinciden.",
-                }), 403
-            session["channel_admin"] = True
-            session["channel_csrf"] = secrets.token_urlsafe(32)
-            session.permanent = True
-        if bot_is_running():
-            started, message = True, "Acceso administrativo recuperado; Telegram sigue en línea."
-        else:
-            started, message = restart_telegram_worker()
-        return jsonify({
-            "ok": started,
-            "already_authorized": True,
-            "worker_starting": started,
-            "message": message,
-            "csrf": session.get("channel_csrf") or _channel_csrf_token(),
-            **({} if started else {"error": message}),
-        })
 
     outcome = _telegram_auth.begin(
         int(api_id), api_hash, phone, data.get("auth_attempt")
@@ -3914,8 +3727,7 @@ def _start_wa_process(
     _secure_directory(auth_dir)
     health_file.unlink(missing_ok=True)
     qr_file.unlink(missing_ok=True)
-    env = os.environ.copy()
-    env.update({
+    env = _channel_worker_environment({
         "WA_AUTH_DIR": str(auth_dir),
         "WA_QR_PATH": str(qr_file),
         "WA_HEALTH_FILE": str(health_file),
@@ -4045,7 +3857,7 @@ def api_test_mode():
             "ok": False,
             "can_manage": False,
             "error_code": "admin_required",
-            "error": "Verifica este navegador con Telegram para consultar el modo de prueba.",
+            "error": "Usa la clave administrativa del operador para consultar el modo de prueba.",
         })
         response.headers["Cache-Control"] = "no-store, private"
         return response, 403
@@ -4818,6 +4630,7 @@ def api_start_botfather():
             proc = subprocess.Popen(
                 [sys.executable, bot_script],
                 stdout=f, stderr=subprocess.STDOUT,
+                env=_channel_worker_environment(),
                 start_new_session=True
             )
             # Guardar PID

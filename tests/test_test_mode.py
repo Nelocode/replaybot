@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import app as app_module
+from tests.admin_session import grant_operator_admin, install_operator_key
 from interaction_state import PersistentInteractionState
 from test_mode import interaction_state_summary, reset_latest_interaction
 
@@ -86,6 +87,7 @@ class TestModeRoutesTests(unittest.TestCase):
     CSRF = "t" * 48
 
     def setUp(self):
+        self.operator_key = install_operator_key(self)
         app_module.app.config.update(TESTING=True)
         self.client = app_module.app.test_client()
         self.temporary = tempfile.TemporaryDirectory()
@@ -104,9 +106,11 @@ class TestModeRoutesTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     def authorize(self):
-        with self.client.session_transaction() as browser_session:
-            browser_session["channel_admin"] = True
-            browser_session["channel_csrf"] = self.CSRF
+        grant_operator_admin(
+            self.client,
+            self.operator_key,
+            csrf=self.CSRF,
+        )
 
     def headers(self):
         return {"X-Channel-CSRF": self.CSRF}

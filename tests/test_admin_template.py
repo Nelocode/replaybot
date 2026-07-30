@@ -109,11 +109,11 @@ class AdminTemplateTestCase(unittest.TestCase):
         self.assertIn("function guideChannelAdminRecovery()", template)
         self.assertIn("🔐 Administrar WA", template)
         self.assertIn("🔐 Recuperar acceso", template)
-        self.assertIn("credenciales actuales de Telegram", template)
+        self.assertIn("clave administrativa", template)
         self.assertIn("latest.whatsapp.reauth_required", template)
         self.assertIn("necesitas un QR nuevo", template)
 
-    def test_linked_telegram_uses_saved_credentials_for_legacy_recovery(self):
+    def test_operator_key_bootstraps_both_linked_and_unlinked_telegram(self):
         template = app_module.TEMPLATE
 
         linked_state = re.search(
@@ -124,70 +124,78 @@ class AdminTemplateTestCase(unittest.TestCase):
         )
         self.assertIsNotNone(linked_state)
         self.assertIn(
-            'tgInitial.style.display = data.can_manage ? "none" : "block";',
+            'tgInitial.style.display = "none";',
             linked_state.group("linked"),
         )
         self.assertIn(
             'tgLinked.style.display = data.can_manage ? "block" : "none";',
             linked_state.group("linked"),
         )
-        self.assertIn('adminAccess.style.display = "none";', linked_state.group("linked"))
-        self.assertIn('tgInitial.style.display = "block";', linked_state.group("unlinked"))
-        self.assertIn('adminAccess.style.display = "none";', linked_state.group("unlinked"))
+        self.assertIn(
+            'adminAccess.style.display = data.can_manage ? "none" : "block";',
+            template,
+        )
+        self.assertIn(
+            'tgCredentialsHelp.style.display = "none";',
+            linked_state.group("linked"),
+        )
+        self.assertIn(
+            'tgCredentialsHelp.style.display = data.can_manage ? "block" : "none";',
+            linked_state.group("unlinked"),
+        )
+        self.assertIn(
+            'tgInitial.style.display = data.can_manage ? "block" : "none";',
+            linked_state.group("unlinked"),
+        )
+        self.assertNotIn(
+            'adminAccess.style.display = "none";',
+            linked_state.group("unlinked"),
+        )
+        operator_gate = template.index(
+            'adminAccess.style.display = data.can_manage ? "none" : "block";'
+        )
+        telegram_branch = template.index("if (tg.linked) {", operator_gate)
+        self.assertLess(operator_gate, telegram_branch)
 
-        link_telegram = re.search(
-            r'async function linkTelegram\(\) \{(?P<body>.*?)'
-            r'\n\}\n\nasync function verifyTgCode',
+        recovery_guide = re.search(
+            r'function guideChannelAdminRecovery\(\) \{(?P<body>.*?)'
+            r'\n\}\n\nfunction setAdminAccessStatus',
             template,
             re.DOTALL,
         )
-        self.assertIsNotNone(link_telegram)
-        self.assertIn("already_authorized", link_telegram.group("body"))
-        self.assertIn("recoveredAdmin", link_telegram.group("body"))
-        self.assertNotIn("admin_verification_required", link_telegram.group("body"))
+        self.assertIsNotNone(recovery_guide)
+        self.assertIn('document.getElementById("admin-operator-key").focus()', recovery_guide.group("body"))
+        self.assertNotIn("tg-api-hash", recovery_guide.group("body"))
+        self.assertNotIn("tg-phone", recovery_guide.group("body"))
 
-    def test_admin_access_flow_uses_csrf_and_refreshes_rotated_token(self):
+    def test_operator_admin_key_flow_is_nontechnical_and_rotates_csrf(self):
         template = app_module.TEMPLATE
-        for endpoint in (
-            "/api/admin_access/request",
-            "/api/admin_access/status",
-            "/api/admin_access/verify",
-            "/api/admin_access/cancel",
-        ):
-            self.assertIn(endpoint, template)
+        self.assertIn('id="admin-operator-key" type="password"', template)
+        self.assertIn('id="admin-operator-key" type="password" autocomplete="off"', template)
+        operator_input = re.search(r'<input id="admin-operator-key"(?P<attrs>[^>]*)>', template)
+        self.assertIsNotNone(operator_input)
+        self.assertNotIn('name=', operator_input.group("attrs"))
+        self.assertIn("Clave administrativa", template)
+        self.assertIn("no necesitas los datos ni el acceso a su Telegram", template)
+        self.assertIn('onclick="recoverOperatorAdminAccess()"', template)
 
-        request_flow = re.search(
-            r'async function requestAdminAccess\(\) \{(?P<body>.*?)'
-            r'\n\}\n\nasync function verifyAdminAccess',
-            template,
-            re.DOTALL,
-        )
-        verify_flow = re.search(
-            r'async function verifyAdminAccess\(\) \{(?P<body>.*?)'
-            r'\n\}\n\nasync function cancelAdminAccess',
-            template,
-            re.DOTALL,
-        )
-        cancel_flow = re.search(
-            r'async function cancelAdminAccess\(\) \{(?P<body>.*?)'
+        recover_flow = re.search(
+            r'async function recoverOperatorAdminAccess\(\) \{(?P<body>.*?)'
             r'\n\}\n\nfunction revealWaQrCard',
             template,
             re.DOTALL,
         )
-        for flow in (request_flow, verify_flow, cancel_flow):
-            self.assertIsNotNone(flow)
-            self.assertIn("headers: channelHeaders()", flow.group("body"))
-
-        self.assertIn(
-            'fetch("/api/admin_access/status", {cache: "no-store"})', template
-        )
-        self.assertIn("if (!/^\\d{8}$/.test(code))", verify_flow.group("body"))
-        self.assertIn("channelCsrf = data.csrf || null;", verify_flow.group("body"))
-        self.assertIn("await loadChannelState(true);", verify_flow.group("body"))
-        self.assertIn("if (latest && latest.csrf) channelCsrf = latest.csrf;", verify_flow.group("body"))
-        self.assertIn("expired_code", template)
-        self.assertIn("delivery_retrying", template)
-        self.assertIn("retry_after", template)
+        self.assertIsNotNone(recover_flow)
+        body = recover_flow.group("body")
+        self.assertIn('fetch("/api/admin_access/operator"', body)
+        self.assertIn("headers: channelHeaders()", body)
+        self.assertIn("body: JSON.stringify({key})", body)
+        self.assertIn("if (data.csrf) channelCsrf = data.csrf;", body)
+        self.assertIn("await loadChannelState(true);", body)
+        self.assertIn("operator_recovery_unconfigured", body)
+        self.assertIn("invalid_operator_key", body)
+        self.assertIn("rate_limited", body)
+        self.assertIn("data.retry_after", body)
 
     def test_every_panel_mutation_uses_the_central_csrf_headers(self):
         template = app_module.TEMPLATE
