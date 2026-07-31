@@ -142,17 +142,22 @@ function loadMessages() {
   return result;
 }
 
-let MESSAGES = loadMessages();
+// El proceso temporal que genera el QR no entrega respuestas. Mantenerlo
+// independiente de messages.json evita que una configuración ausente o en
+// pleno guardado impida volver a vincular WhatsApp.
+let MESSAGES = LINK_ONLY ? {} : loadMessages();
 
 // ── Watch messages.json para recargar en caliente (cuando admin panel guarda) ──
-fs.watchFile(MESSAGES_FILE, () => {
-  try {
-    MESSAGES = loadMessages();
-    console.log(`[WA] messages.json recargado — ${Object.keys(MESSAGES).length} idiomas`);
-  } catch (e) {
-    console.error('[WA] Error recargando messages.json:', e.message);
-  }
-});
+if (!LINK_ONLY) {
+  fs.watchFile(MESSAGES_FILE, () => {
+    try {
+      MESSAGES = loadMessages();
+      console.log(`[WA] messages.json recargado — ${Object.keys(MESSAGES).length} idiomas`);
+    } catch (e) {
+      console.error('[WA] Error recargando messages.json:', e.message);
+    }
+  });
+}
 
 // ── Detección de idioma (misma lógica que bot.py) ──
 const LANG_PATTERNS = {
