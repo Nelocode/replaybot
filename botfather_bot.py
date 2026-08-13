@@ -13,11 +13,17 @@ from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
+from botfather_language_state import (
+    apply_message_language_evidence,
+    detect_supported_language,
+)
+
 # ── Config ────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 AUDIO_DIR = DATA_DIR / "audios"
 MESSAGES_FILE = DATA_DIR / "messages.json"
+DEFAULT_MESSAGES_FILE = BASE_DIR / "messages.json"
 RESET_TIMEOUT = 3600
 
 BOT_TOKEN = os.environ.get("AUTOREPLY_BOT_TOKEN")
@@ -42,13 +48,12 @@ BOT_TOKEN = os.environ.get("AUTOREPLY_BOT_TOKEN")  # Re-leer
 
 if not BOT_TOKEN:
     logging.warning("AUTOREPLY_BOT_TOKEN not set. BotFather bot will not start.")
-    # Don't crash — just log and exit gracefully
-    import sys
-    sys.exit(0)
+    # Import stays safe for diagnostics/tests; main() performs the no-token exit.
 
 # ── Mensajes ───────────────────────────────────────────────────────────
 def load_messages() -> dict:
-    with open(MESSAGES_FILE, "r", encoding="utf-8") as f:
+    source = MESSAGES_FILE if MESSAGES_FILE.is_file() else DEFAULT_MESSAGES_FILE
+    with open(source, "r", encoding="utf-8") as f:
         data = json.load(f)
     result = {}
     for lang, lang_data in data.items():
@@ -91,27 +96,11 @@ LANG_KEYWORDS = {
     ),
 }
 
-AMBIGUOUS = {"ok", "no", "si", "hey", "hi", "hello"}
+AMBIGUOUS = {"ok", "no", "si", "hey"}
 
 
-def detect_lang(text: str) -> str:
-    scores = {"es": 0, "en": 0, "fr": 0}
-    for lang, pattern in LANG_KEYWORDS.items():
-        matches = pattern.findall(text)
-        for m in matches:
-            if m.lower() not in AMBIGUOUS:
-                scores[lang] += 1.0
-    lang_markers = {
-        "es": re.compile(r"\b(español|castellano|hablo español|hablo espanol)\b", re.IGNORECASE),
-        "en": re.compile(r"\b(english|speak english)\b", re.IGNORECASE),
-        "fr": re.compile(r"\b(français|francais|parle français|parle francais)\b", re.IGNORECASE),
-    }
-    for lang, marker in lang_markers.items():
-        if marker.search(text):
-            scores[lang] += 20
-    if max(scores.values()) < 1:
-        return "en"
-    return max(scores, key=scores.get)
+def detect_lang(text: str) -> str | None:
+    return detect_supported_language(text)
 
 
 def is_expired(state: dict) -> bool:
@@ -137,9 +126,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    text = (update.message.text or "").strip()
-    if not text:
-        return
+    text = (update.message.text or update.message.caption or "").strip()
 
     now = time.time()
     state = user_state.get(chat_id)
@@ -148,11 +135,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if state is not None:
             logging.info("[BF chat=%s] EXPIRED — new cycle", chat_id)
         load_messages_fresh()
-        detected = detect_lang(text)
-        state = {"lang": detected, "step": 0, "last_seen": now}
+        state = {"step": 0, "last_seen": now}
+        apply_message_language_evidence(state, update.message)
         user_state[chat_id] = state
         step_to_use = 0
     else:
+        apply_message_language_evidence(state, update.message)
         step_to_use = min(state["step"] + 1, len(MESSAGES.get(state["lang"], MESSAGES["en"])["steps"]) - 1)
         state["last_seen"] = now
 
@@ -186,7 +174,16 @@ async def handle_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info("[BF chat=%s] VOICE/VIDEO received", chat_id)
 
     state = user_state.get(chat_id)
-    lang = state["lang"] if (state and not is_expired(state)) else "en"
+    now = time.time()
+    if state is None or is_expired(state):
+        load_messages_fresh()
+        state = {"step": 0, "last_seen": now}
+        apply_message_language_evidence(state, update.message)
+        user_state[chat_id] = state
+    else:
+        apply_message_language_evidence(state, update.message)
+        state["last_seen"] = now
+    lang = state["lang"]
 
     lang_data = MESSAGES.get(lang, MESSAGES["en"])
     call_data = lang_data.get("call", {"text": "📞 Llamada recibida", "audio": ""})
@@ -233,7 +230,11 @@ def main():
             app = Application.builder().token(BOT_TOKEN).build()
 
             app.add_handler(CommandHandler("start", start))
-            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+            content_filter = (
+                filters.TEXT
+                | (filters.ATTACHMENT & ~filters.VOICE & ~filters.VIDEO_NOTE)
+            ) & ~filters.COMMAND
+            app.add_handler(MessageHandler(content_filter, handle_message))
             app.add_handler(MessageHandler(filters.VOICE | filters.VIDEO_NOTE, handle_call))
             app.add_error_handler(error_handler)
 

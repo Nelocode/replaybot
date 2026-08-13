@@ -377,6 +377,42 @@ test('cada intento de llamada usa CALL aunque existan llamadas anteriores', asyn
   );
 });
 
+test('primera llamada usa provisional del prefijo y texto detectado puede reemplazarlo', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-call-state-'));
+  const filePath = path.join(directory, 'state.json');
+  const state = new PersistentInteractionState({ filePath });
+  const languages = [];
+  const handler = createWhatsAppCallHandler({
+    rejectCall: async () => {},
+    sendMessage: async () => {},
+    getResponseMessage: (language, key) => {
+      languages.push([language, key]);
+      return { text: '', audio: '' };
+    },
+    routeInteraction: details => state.register(details),
+    resolveContactId: async () => '573001234567@s.whatsapp.net',
+    readAudio: async () => null,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  await handler([offer({
+    from: '123456789@lid',
+    chatId: '123456789@lid',
+    callerPn: undefined,
+  })]);
+  const followingText = state.register({
+    contactId: '573001234567@s.whatsapp.net',
+    eventId: 'message:english',
+    kind: 'content',
+    detectedLanguage: 'en',
+  });
+
+  assert.deepEqual(languages, [['es', 'call']]);
+  assert.equal(followingText.language, 'en');
+  const contact = Object.values(JSON.parse(fs.readFileSync(filePath, 'utf8')).contacts)[0];
+  assert.equal(contact.language_provisional, false);
+});
+
 test('una llamada posterior a un mensaje también envía CALL', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-call-state-'));
   const state = new PersistentInteractionState({ filePath: path.join(directory, 'state.json') });
@@ -467,4 +503,31 @@ test('si falla el estado la llamada se rechaza de todas formas', async () => {
 
   assert.equal(result[0].reason, 'interaction_state_failed');
   assert.deepEqual(effects, ['reject']);
+});
+
+test('operational pause rejects the call without consuming interaction state', async () => {
+  let allowed = false;
+  let routes = 0;
+  const effects = [];
+  const handler = createWhatsAppCallHandler({
+    rejectCall: async () => effects.push('reject'),
+    sendMessage: async () => effects.push('send'),
+    deliveryAllowed: () => allowed,
+    getResponseMessage: () => ({ text: 'call', audio: '' }),
+    routeInteraction: async () => {
+      routes += 1;
+      return { language: 'es', responseKey: 'call', contactKey: 'contact' };
+    },
+    readAudio: async () => null,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  const blocked = await handler([offer({ id: 'paused-call' })]);
+  allowed = true;
+  const resumed = await handler([offer({ id: 'resumed-call' })]);
+
+  assert.equal(blocked[0].reason, 'delivery_blocked');
+  assert.equal(resumed[0].status, 'handled');
+  assert.equal(routes, 1);
+  assert.deepEqual(effects, ['reject', 'reject', 'send']);
 });

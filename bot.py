@@ -25,6 +25,7 @@ from telethon import TelegramClient, errors, events, utils
 from telethon.tl import types
 
 from interaction_state import PersistentInteractionState
+from language_detection import detect_supported_language
 from message_schema import load_message_file
 from telegram_audio_branding import (
     brand_audio_attributes,
@@ -165,17 +166,7 @@ LANG_MARKERS = {
 
 
 def detect_lang(text: str) -> str | None:
-    scores = {"es": 0.0, "en": 0.0, "fr": 0.0}
-    for language, pattern in LANG_KEYWORDS.items():
-        for match in pattern.findall(text):
-            if match.lower() not in AMBIGUOUS:
-                scores[language] += 1.0
-    for language, marker in LANG_MARKERS.items():
-        if marker.search(text):
-            scores[language] += 20
-    if max(scores.values()) < 1:
-        return None
-    return max(scores, key=scores.get)
+    return detect_supported_language(text)
 
 
 def load_messages_fresh() -> None:
@@ -479,6 +470,7 @@ async def process_interaction(
     event_id: str,
     kind: str,
     detected_language: str | None = None,
+    provisional_language: str | None = None,
     reply_peer: object | None = None,
 ) -> None:
     decision = await telegram_dispatcher.dispatch(
@@ -486,6 +478,7 @@ async def process_interaction(
         event_id=event_id,
         kind=kind,
         detected_language=detected_language,
+        provisional_language=provisional_language,
         reply_peer=reply_peer,
     )
     if decision.duplicate:
@@ -527,6 +520,7 @@ async def handle_message(event) -> None:
         event_id=interaction.event_id,
         kind=interaction.kind,
         detected_language=detect_lang(interaction.text) if interaction.text else None,
+        provisional_language="es",
         reply_peer=interaction.reply_peer,
     )
 
@@ -557,6 +551,7 @@ async def handle_phone_call(update) -> None:
         chat_id=interaction.contact_id,
         event_id=interaction.event_id,
         kind=interaction.kind,
+        provisional_language="es",
         reply_peer=reply_peer,
     )
 
@@ -593,6 +588,7 @@ async def handle_missed_call_service(update) -> None:
             chat_id=interaction.contact_id,
             event_id=interaction.event_id,
             kind=interaction.kind,
+            provisional_language="es",
             reply_peer=reply_peer,
         )
     except Exception:

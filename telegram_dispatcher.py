@@ -110,6 +110,7 @@ class TelegramInteractionDispatcher:
         event_id: str,
         kind: str,
         detected_language: str | None = None,
+        provisional_language: str | None = None,
         reply_peer: object | None = None,
     ) -> InteractionDecision:
         lock = self._locks.setdefault(chat_id, asyncio.Lock())
@@ -119,6 +120,7 @@ class TelegramInteractionDispatcher:
                 event_id=event_id,
                 kind=kind,
                 detected_language=detected_language,
+                provisional_language=provisional_language,
             )
             if not decision.duplicate and decision.response_key:
                 delivery_fingerprint = interaction_delivery_fingerprint(chat_id, event_id)
@@ -133,5 +135,6 @@ class TelegramInteractionDispatcher:
                     event_id=event_id,
                     kind=kind,
                     detected_language=detected_language,
+                    provisional_language=provisional_language,
                 )
             return decision

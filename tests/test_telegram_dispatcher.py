@@ -149,6 +149,31 @@ class TelegramInteractionDispatcherTests(unittest.IsolatedAsyncioTestCase):
                 order,
             )
 
+    async def test_provisional_spanish_is_replaced_by_detected_customer_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = PersistentInteractionState(Path(directory) / "state.json")
+            deliveries = []
+
+            async def send_response(_peer, key, language, _fingerprint):
+                deliveries.append((key, language))
+
+            dispatcher = TelegramInteractionDispatcher(state, send_response)
+            await dispatcher.dispatch(
+                chat_id=1,
+                event_id="message:image",
+                kind="content",
+                provisional_language="es",
+            )
+            await dispatcher.dispatch(
+                chat_id=1,
+                event_id="message:text",
+                kind="content",
+                detected_language="en",
+                provisional_language="es",
+            )
+
+            self.assertEqual([("step1", "es"), ("step2", "en")], deliveries)
+
     async def test_duplicate_does_not_send_a_second_response(self):
         with tempfile.TemporaryDirectory() as directory:
             state = PersistentInteractionState(Path(directory) / "state.json")

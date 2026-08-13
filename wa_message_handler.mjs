@@ -5,6 +5,7 @@ import {
 } from '@whiskeysockets/baileys';
 import { settleWithTimeout } from './keyed_serial_queue.mjs';
 import { toWhatsAppAudioContent } from './wa_audio_delivery.mjs';
+import { provisionalLanguageFromWhatsAppIdentity } from './whatsapp_language_hint.mjs';
 
 const DEFAULT_CONTACT_RESOLUTION_TIMEOUT_MS = 5_000;
 const DEFAULT_SEND_TIMEOUT_MS = 20_000;
@@ -130,6 +131,8 @@ export function createWhatsAppMessageHandler({
   getResponseMessage,
   readAudio,
   detectLanguage,
+  markRead = async () => {},
+  deliveryAllowed = () => true,
   resolvePnForLid = async () => null,
   serializeClaim = async operation => operation(),
   serializeInteraction = async (_contactId, operation) => operation(),
@@ -144,6 +147,10 @@ export function createWhatsAppMessageHandler({
   if (typeof getResponseMessage !== 'function') throw new TypeError('getResponseMessage is required');
   if (typeof readAudio !== 'function') throw new TypeError('readAudio is required');
   if (typeof detectLanguage !== 'function') throw new TypeError('detectLanguage is required');
+  if (typeof markRead !== 'function') throw new TypeError('markRead must be a function');
+  if (typeof deliveryAllowed !== 'function') {
+    throw new TypeError('deliveryAllowed must be a function');
+  }
   if (typeof serializeClaim !== 'function') {
     throw new TypeError('serializeClaim must be a function');
   }
@@ -161,7 +168,7 @@ export function createWhatsAppMessageHandler({
     throw new TypeError('sendTimeoutMs must be positive');
   }
 
-  async function deliverResponse({ jid, decision }) {
+  async function deliverResponse({ jid, decision, messageKey }) {
     const response = getResponseMessage(decision.language, decision.responseKey) || {};
     const result = {
       status: 'handled',
@@ -169,6 +176,13 @@ export function createWhatsAppMessageHandler({
       text: 'skipped',
       audio: 'skipped',
     };
+
+    try {
+      await markRead(messageKey);
+    } catch {
+      // Read receipts are best effort and must not prevent a valid response.
+      logger.warn?.('[WA] Read receipt failed');
+    }
 
     const text = typeof response.text === 'string' ? response.text.trim() : '';
     if (text) {
@@ -224,6 +238,12 @@ export function createWhatsAppMessageHandler({
     if (!interaction) {
       return { status: 'ignored', reason: 'non_interaction' };
     }
+    if (interaction.contentType === 'albumMessage' && !interaction.text) {
+      // Baileys may emit the album envelope in an earlier callback than its
+      // children. It carries no customer evidence and must never consume the
+      // event id, phase, or provisional language before a caption arrives.
+      return { status: 'ignored', reason: 'album_placeholder' };
+    }
 
     const eventId = interactionEventId(msg, interaction.contentType);
     if (!eventId) {
@@ -246,17 +266,29 @@ export function createWhatsAppMessageHandler({
           jid = await selectDirectMessageTarget(msg, async () => null);
         }
         if (!jid) return { ignored: { status: 'ignored', reason: 'non_direct' } };
+        try {
+          if (!await deliveryAllowed()) {
+            return { ignored: { status: 'ignored', reason: 'delivery_blocked' } };
+          }
+        } catch {
+          return { ignored: { status: 'ignored', reason: 'delivery_blocked' } };
+        }
 
+        const contactAliases = [
+          normalizeJid(msg?.key?.remoteJid || ''),
+          normalizeJid(msg?.key?.remoteJidAlt || ''),
+          jid,
+        ].filter(Boolean);
+        const detectedLanguage = interaction.text ? detectLanguage(interaction.text) : null;
         const decision = await routeInteraction({
           contactId: jid,
-          contactAliases: [
-            normalizeJid(msg?.key?.remoteJid || ''),
-            normalizeJid(msg?.key?.remoteJidAlt || ''),
-            jid,
-          ].filter(Boolean),
+          contactAliases,
           eventId,
           kind: 'content',
-          detectedLanguage: interaction.text ? detectLanguage(interaction.text) : null,
+          detectedLanguage,
+          provisionalLanguage: detectedLanguage
+            ? null
+            : provisionalLanguageFromWhatsAppIdentity(contactAliases),
         });
         return { jid, decision };
       });
@@ -272,12 +304,93 @@ export function createWhatsAppMessageHandler({
 
     return serializeInteraction(
       claimed.decision.contactKey || claimed.jid,
-      () => deliverResponse({ jid: claimed.jid, decision: claimed.decision }),
+      () => deliverResponse({
+        jid: claimed.jid,
+        decision: claimed.decision,
+        messageKey: msg?.key,
+      }),
     );
   }
 
   return async function handleMessageBatch({ messages = [], type } = {}) {
     if (!['notify', 'append'].includes(type) || !Array.isArray(messages)) return [];
-    return Promise.all(messages.map(msg => processOne(msg, type)));
+    // Baileys may deliver an empty album parent before a child carrying the
+    // only useful caption. Both intentionally share one event id. Select the
+    // text-bearing representative first so the empty parent cannot lock a
+    // provisional language and make the caption look like a persisted retry.
+    const batchEvents = messages.map(msg => {
+      const interaction = describeInteraction(msg?.message);
+      if (!interaction) return null;
+      const eventId = interactionEventId(msg, interaction.contentType);
+      const identity = [
+        normalizeJid(msg?.key?.remoteJid || ''),
+        normalizeJid(msg?.key?.remoteJidAlt || ''),
+      ].filter(Boolean);
+      return {
+        eventId,
+        identities: new Set(identity),
+        hasText: Boolean(interaction.text),
+        isAlbumPlaceholder: interaction.contentType === 'albumMessage'
+          && !interaction.text,
+      };
+    });
+
+    // Identity metadata can become richer within one batch: an album parent
+    // may carry only a LID while its child carries PN + LID. Build connected
+    // components for the same logical event instead of requiring exact sets.
+    // Transitive overlap also covers LID -> (LID, PN) -> PN sequences.
+    const componentParents = batchEvents.map((_event, index) => index);
+    const findComponent = index => {
+      let root = index;
+      while (componentParents[root] !== root) root = componentParents[root];
+      while (componentParents[index] !== index) {
+        const parent = componentParents[index];
+        componentParents[index] = root;
+        index = parent;
+      }
+      return root;
+    };
+    const joinComponents = (left, right) => {
+      const leftRoot = findComponent(left);
+      const rightRoot = findComponent(right);
+      if (leftRoot !== rightRoot) componentParents[rightRoot] = leftRoot;
+    };
+    for (let left = 0; left < batchEvents.length; left += 1) {
+      const leftEvent = batchEvents[left];
+      if (!leftEvent?.eventId || leftEvent.identities.size === 0) continue;
+      for (let right = left + 1; right < batchEvents.length; right += 1) {
+        const rightEvent = batchEvents[right];
+        if (!rightEvent || rightEvent.eventId !== leftEvent.eventId) continue;
+        const overlaps = [...leftEvent.identities]
+          .some(identity => rightEvent.identities.has(identity));
+        if (overlaps) joinComponents(left, right);
+      }
+    }
+
+    const preferredByComponent = new Map();
+    for (const [index, event] of batchEvents.entries()) {
+      if (!event?.eventId) continue;
+      const component = findComponent(index);
+      const current = preferredByComponent.get(component);
+      const priority = event.hasText ? 2 : (event.isAlbumPlaceholder ? 0 : 1);
+      if (!current || priority > current.priority) {
+        preferredByComponent.set(component, { index, priority });
+      }
+    }
+
+    return Promise.all(messages.map((msg, index) => {
+      const event = batchEvents[index];
+      const component = event?.eventId ? findComponent(index) : null;
+      if (
+        component !== null
+        && preferredByComponent.get(component)?.index !== index
+      ) {
+        return {
+          status: 'ignored',
+          reason: event.isAlbumPlaceholder ? 'album_placeholder' : 'duplicate',
+        };
+      }
+      return processOne(msg, type);
+    }));
   };
 }

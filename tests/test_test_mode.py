@@ -1,4 +1,6 @@
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,10 +9,168 @@ from unittest.mock import patch
 import app as app_module
 from tests.admin_session import grant_operator_admin, install_operator_key
 from interaction_state import PersistentInteractionState
-from test_mode import interaction_state_summary, reset_latest_interaction
+from test_mode import (
+    interaction_state_summary,
+    normalize_whatsapp_phone,
+    reset_latest_interaction,
+    reset_whatsapp_interaction_by_number,
+)
 
 
 class TestModeStateTests(unittest.TestCase):
+    def test_whatsapp_phone_normalization_is_strict_and_ephemeral(self):
+        self.assertEqual("573001234567", normalize_whatsapp_phone("+57 300-123-4567"))
+        for value in (
+            None, "", "+123", "+01234567", "573001234567", "00573001234567",
+            "+57abc1234567", "+57\n3001234567", "+573001234567@s.whatsapp.net",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(normalize_whatsapp_phone(value))
+
+    def test_specific_whatsapp_number_resolves_v2_alias_without_storing_number(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = root / "wa_interaction_state.json"
+            phone = "+573001234567"
+            pn_key = PersistentInteractionState._fingerprint(
+                "contact", "573001234567@s.whatsapp.net"
+            )
+            canonical_key = "canonical-lid-hash"
+            original = {
+                "version": 2,
+                "contacts": {
+                    canonical_key: {
+                        "phase": 2,
+                        "language": "es",
+                        "recent_events": ["event-hash"],
+                        "updated_at": 50,
+                    },
+                    "unrelated": {"phase": 2, "updated_at": 60},
+                },
+                "aliases": {pn_key: canonical_key},
+            }
+            state_path.write_text(json.dumps(original), encoding="utf-8")
+
+            result = reset_whatsapp_interaction_by_number(
+                state_path,
+                backup_dir=root / "backups",
+                phone=phone,
+                language="en",
+            )
+
+            serialized = state_path.read_text(encoding="utf-8")
+            current = json.loads(serialized)
+            self.assertEqual(0, current["contacts"][canonical_key]["phase"])
+            self.assertEqual("en", current["contacts"][canonical_key]["language"])
+            self.assertEqual([], current["contacts"][canonical_key]["recent_events"])
+            self.assertNotIn("573001234567", serialized)
+            self.assertTrue(result["reset"])
+
+    def test_specific_new_whatsapp_number_is_preconfigured_by_hash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = root / "wa_interaction_state.json"
+
+            result = reset_whatsapp_interaction_by_number(
+                state_path,
+                backup_dir=root / "backups",
+                phone="+573001234567",
+                language=None,
+            )
+
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(2, payload["version"])
+            self.assertEqual(1, len(payload["contacts"]))
+            state = next(iter(payload["contacts"].values()))
+            self.assertEqual(
+                {
+                    "phase": 0,
+                    "language": None,
+                    "recent_events": [],
+                    "updated_at": 0,
+                    "reset_pending": True,
+                },
+                state,
+            )
+            self.assertEqual(2, len(payload["aliases"]))
+            self.assertIsNone(result["backup"])
+            self.assertNotIn("573001234567", state_path.read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js no está disponible")
+    def test_lid_only_history_honors_number_reset_once_when_pn_is_observed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = root / "wa_interaction_state.json"
+            lid = "123456789@lid"
+            pn = "573001234567@s.whatsapp.net"
+            lid_key = PersistentInteractionState._fingerprint("contact", lid)
+            state_path.write_text(
+                json.dumps({
+                    "version": 2,
+                    "contacts": {
+                        lid_key: {
+                            "phase": 2,
+                            "language": "es",
+                            "recent_events": ["old-event-hash"],
+                            "updated_at": 50,
+                        },
+                    },
+                    "aliases": {lid_key: lid_key},
+                }),
+                encoding="utf-8",
+            )
+
+            reset_whatsapp_interaction_by_number(
+                state_path,
+                backup_dir=root / "backups",
+                phone="+573001234567",
+                language="en",
+            )
+
+            module_uri = (
+                Path(__file__).resolve().parents[1] / "interaction_state.mjs"
+            ).as_uri()
+            script = """
+const { PersistentInteractionState } = await import(process.argv[1]);
+const store = new PersistentInteractionState({
+  filePath: process.argv[2],
+  logger: { error() {} },
+});
+const contactAliases = [process.argv[3], process.argv[4]];
+const first = store.register({
+  contactId: process.argv[4], contactAliases,
+  eventId: 'after-reset', kind: 'content', detectedLanguage: 'fr',
+});
+const second = store.register({
+  contactId: process.argv[3], contactAliases,
+  eventId: 'after-reset-2', kind: 'content', detectedLanguage: 'fr',
+});
+process.stdout.write(JSON.stringify({ first, second }));
+"""
+            completed = subprocess.run(
+                [
+                    shutil.which("node"), "--input-type=module", "-e", script,
+                    module_uri, str(state_path), lid, pn,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            decisions = json.loads(completed.stdout)
+            self.assertEqual("step1", decisions["first"]["responseKey"])
+            self.assertEqual("en", decisions["first"]["language"])
+            self.assertEqual("step2", decisions["second"]["responseKey"])
+            self.assertEqual("en", decisions["second"]["language"])
+
+            serialized = state_path.read_text(encoding="utf-8")
+            payload = json.loads(serialized)
+            self.assertEqual(1, len(payload["contacts"]))
+            self.assertNotIn("reset_pending", serialized)
+            self.assertNotIn("573001234567", serialized)
+            self.assertNotIn("123456789", serialized)
+
     def test_reset_latest_whatsapp_keeps_aliases_and_creates_backup(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -150,6 +310,8 @@ class TestModeRoutesTests(unittest.TestCase):
         )
         self.assertEqual(200, enabled.status_code)
         self.assertTrue(enabled.get_json()["enabled"])
+        self.assertNotIn("telegram", enabled.get_json())
+        self.assertNotIn("whatsapp", enabled.get_json())
 
     def test_reset_is_blocked_until_test_mode_is_enabled(self):
         self.authorize()
@@ -160,6 +322,75 @@ class TestModeRoutesTests(unittest.TestCase):
         )
         self.assertEqual(409, response.status_code)
         self.assertEqual("test_mode_disabled", response.get_json()["error_code"])
+
+    def test_specific_whatsapp_number_requires_admin_csrf_and_valid_input(self):
+        self.authorize()
+        self.client.post(
+            "/api/test_mode", json={"enabled": True}, headers=self.headers()
+        )
+        payload = {
+            "channel": "whatsapp",
+            "target": "number",
+            "whatsapp_number": "+573001234567",
+            "language": "en",
+            "confirm": True,
+        }
+        missing_csrf = self.client.post("/api/test_mode/reset", json=payload)
+        self.assertEqual(403, missing_csrf.status_code)
+
+        invalid = self.client.post(
+            "/api/test_mode/reset",
+            json={**payload, "whatsapp_number": "+57oops"},
+            headers=self.headers(),
+        )
+        self.assertEqual(400, invalid.status_code)
+        self.assertEqual("invalid_whatsapp_number", invalid.get_json()["error_code"])
+        self.assertEqual("no-store, private", invalid.headers["Cache-Control"])
+
+        wrong_channel = self.client.post(
+            "/api/test_mode/reset",
+            json={**payload, "channel": "telegram"},
+            headers=self.headers(),
+        )
+        self.assertEqual(400, wrong_channel.status_code)
+
+    def test_specific_whatsapp_existing_and_new_responses_are_non_enumerable(self):
+        self.authorize()
+        self.client.post(
+            "/api/test_mode", json={"enabled": True}, headers=self.headers()
+        )
+        self.seed_state(app_module.WA_INTERACTION_STATE_FILE, 2)
+
+        def reset(phone):
+            with (
+                patch.object(app_module, "_test_mode_switch_conflict", return_value=None),
+                patch.object(app_module, "_wa_process_running", return_value=False),
+            ):
+                return self.client.post(
+                    "/api/test_mode/reset",
+                    json={
+                        "channel": "whatsapp",
+                        "target": "number",
+                        "whatsapp_number": phone,
+                        "language": "en",
+                        "confirm": True,
+                    },
+                    headers=self.headers(),
+                )
+
+        first = reset("+573001234567")
+        second = reset("+573009876543")
+        self.assertEqual(200, first.status_code)
+        self.assertEqual(200, second.status_code)
+        first_result = first.get_json()["results"]["whatsapp"]
+        second_result = second.get_json()["results"]["whatsapp"]
+        self.assertEqual(first.get_json(), second.get_json())
+        self.assertEqual(first_result, second_result)
+        self.assertEqual({"reset", "language"}, set(first_result))
+        for response in (first, second):
+            body = response.get_data(as_text=True)
+            self.assertNotRegex(body, r"57300|@s\.whatsapp\.net|@hosted")
+            self.assertEqual("no-store, private", response.headers["Cache-Control"])
 
     def test_enable_reports_persistence_failure_without_crashing(self):
         self.authorize()

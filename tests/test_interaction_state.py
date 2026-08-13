@@ -116,6 +116,51 @@ class PersistentInteractionStateTests(unittest.TestCase):
             self.assertEqual("fr", text.language)
             self.assertEqual("step2", text.response_key)
 
+    def test_telegram_spanish_is_provisional_until_text_proves_language(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            store = self.make_store(directory, default_language="es")
+            image = store.register(
+                contact_id=1,
+                event_id="message:image",
+                kind="content",
+                provisional_language="es",
+            )
+            english = store.register(
+                contact_id=1,
+                event_id="message:text",
+                kind="content",
+                detected_language="en",
+                provisional_language="es",
+            )
+            later_french = store.register(
+                contact_id=1,
+                event_id="message:later",
+                kind="content",
+                detected_language="fr",
+            )
+
+            self.assertEqual("es", image.language)
+            self.assertEqual("en", english.language)
+            self.assertEqual("en", later_french.language)
+            contact = next(iter(json.loads(state_path.read_text(encoding="utf-8"))["contacts"].values()))
+            self.assertEqual("en", contact["language"])
+            self.assertFalse(contact["language_provisional"])
+
+    def test_initial_detected_text_is_confirmed_over_provisional_hint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.make_store(directory)
+            decision = store.register(
+                contact_id=1,
+                event_id="message:text",
+                kind="content",
+                detected_language="fr",
+                provisional_language="es",
+            )
+
+            self.assertEqual("fr", decision.language)
+            self.assertFalse(next(iter(store._contacts.values()))["language_provisional"])
+
     def test_state_file_does_not_contain_raw_customer_or_event_ids(self):
         with tempfile.TemporaryDirectory() as directory:
             store = self.make_store(directory)

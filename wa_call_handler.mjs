@@ -1,6 +1,7 @@
 import { jidNormalizedUser } from '@whiskeysockets/baileys';
 import { settleWithTimeout } from './keyed_serial_queue.mjs';
 import { toWhatsAppAudioContent } from './wa_audio_delivery.mjs';
+import { provisionalLanguageFromWhatsAppIdentity } from './whatsapp_language_hint.mjs';
 
 const DEFAULT_DEDUPE_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_REJECT_TIMEOUT_MS = 5_000;
@@ -66,6 +67,7 @@ export function createWhatsAppCallHandler({
   getResponseMessage = null,
   routeInteraction = null,
   resolveContactId = async (jid) => jid,
+  deliveryAllowed = () => true,
   serializeClaim = async operation => operation(),
   serializeInteraction = async (_contactId, operation) => operation(),
   readAudio,
@@ -92,6 +94,9 @@ export function createWhatsAppCallHandler({
   }
   if (typeof resolveContactId !== 'function') {
     throw new TypeError('resolveContactId debe ser una función');
+  }
+  if (typeof deliveryAllowed !== 'function') {
+    throw new TypeError('deliveryAllowed must be a function');
   }
   if (typeof serializeClaim !== 'function') {
     throw new TypeError('serializeClaim debe ser una función');
@@ -221,6 +226,14 @@ export function createWhatsAppCallHandler({
           logger.warn?.('[WA CALL] Contact mapping failed; using reply target');
         }
 
+        try {
+          if (!await deliveryAllowed()) {
+            return { contactId, interactionDecision: null, deliveryBlocked: true };
+          }
+        } catch {
+          return { contactId, interactionDecision: null, deliveryBlocked: true };
+        }
+
         let interactionDecision = null;
         if (routeInteraction) {
           interactionDecision = await routeInteraction({
@@ -229,6 +242,10 @@ export function createWhatsAppCallHandler({
             eventId: `call:${call.id}`,
             kind: 'call',
             detectedLanguage: null,
+            provisionalLanguage: provisionalLanguageFromWhatsAppIdentity(
+              contactId,
+              contactAliases,
+            ),
           });
         }
         return { contactId, interactionDecision };
@@ -242,6 +259,19 @@ export function createWhatsAppCallHandler({
       };
       return finish(call, failedResult, 'interaction_state_failed', {
         ...failedResult,
+        targetSource: replyTarget.source,
+        targetKind: replyTarget.kind,
+      });
+    }
+
+    if (claimed.deliveryBlocked) {
+      const blockedResult = {
+        status: 'ignored',
+        reason: 'delivery_blocked',
+        reject: await rejectionPromise,
+      };
+      return finish(call, blockedResult, 'delivery_blocked', {
+        ...blockedResult,
         targetSource: replyTarget.source,
         targetKind: replyTarget.kind,
       });

@@ -96,7 +96,11 @@ class AdminTemplateTestCase(unittest.TestCase):
         self.assertIn("resetTestConversation('whatsapp')", template)
         self.assertIn("resetTestConversation('both')", template)
         self.assertIn('id="test-mode-language"', template)
-        self.assertIn("body: JSON.stringify({channel, language, confirm: true})", template)
+        self.assertIn('id="test-mode-whatsapp-number"', template)
+        self.assertIn("resetTestConversation('whatsapp', 'number')", template)
+        self.assertIn('const payload = {channel, language, target, confirm: true};', template)
+        self.assertIn("payload.whatsapp_number = whatsappNumber", template)
+        self.assertNotIn("conversation_count", template)
         self.assertIn("Úsalo sin tráfico real simultáneo", template)
 
     def test_whatsapp_state_refresh_and_recovery_are_actionable(self):
@@ -276,6 +280,19 @@ class AdminTemplateTestCase(unittest.TestCase):
             'img.src = "/api/switch_wa/qr?ts=" + Date.now();',
             template,
         )
+
+    def test_whatsapp_operational_health_has_safe_actions_and_live_polling(self):
+        template = app_module.TEMPLATE
+        self.assertIn('id="wa-risk-badge"', template)
+        self.assertIn('id="wa-safety-alert"', template)
+        self.assertIn("Pausar envíos", template)
+        self.assertIn("Reanudar bajo revisión", template)
+        self.assertIn('fetch("/api/wa_safety_health"', template)
+        self.assertIn('fetch("/api/wa_safety/pause"', template)
+        self.assertIn("headers: channelHeaders()", template)
+        self.assertIn("review_confirmed", template)
+        self.assertIn("setInterval(loadWaSafetyHealth, 10000);", template)
+        self.assertNotIn("Cambiar Número Ahora", template)
 
 
 if __name__ == "__main__":
