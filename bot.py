@@ -16,7 +16,6 @@ import json
 import logging
 import os
 from pathlib import Path
-import re
 import time
 from types import SimpleNamespace
 import uuid
@@ -25,7 +24,7 @@ from telethon import TelegramClient, errors, events, utils
 from telethon.tl import types
 
 from interaction_state import PersistentInteractionState
-from language_detection import detect_supported_language
+from language_detection import detect_language_evidence, detect_supported_language
 from message_schema import load_message_file
 from telegram_audio_branding import (
     brand_audio_attributes,
@@ -128,41 +127,6 @@ interaction_state = PersistentInteractionState(
     INTERACTION_STATE_FILE,
     default_language=DEFAULT_LANGUAGE,
 )
-
-
-LANG_KEYWORDS = {
-    "es": re.compile(
-        r"\b(hola|gracias|por\s*favor|buenos\s*días|quiero|necesito|ayuda|habla|"
-        r"precio|precios|tarifa|tarifas|reserva|reservas|foto|fotos|vídeo|vídeos|video|videos|"
-        r"buenas|amigo|claro|vale|dale|listo|entiendo|puedes|hacer|"
-        r"dónde|cuándo|cómo|cuál|quién|eso|esto|algo|nada|todo|más|menos|"
-        r"está|estoy|estamos|están|tengo|tiene|tenemos|soy|eres|somos|son)\b",
-        re.IGNORECASE,
-    ),
-    "en": re.compile(
-        r"\b(hello|hi|thanks|thank\s*you|please|help|want|need|can\s*i|"
-        r"price|prices|rate|rates|book|booking|photo|photos|video|videos|"
-        r"yes|sure|fine|good|great|hey|would|could|should|"
-        r"where|when|how|what|who|that|this|there|here|"
-        r"is|are|am|have|has|do|does|did|will|may|might)\b",
-        re.IGNORECASE,
-    ),
-    "fr": re.compile(
-        r"\b(bonjour|merci|s'il\s*vous\s*plaît|aide|besoin|vouloir|"
-        r"prix|tarif|tarifs|réservation|réserver|photo|photos|vidéo|vidéos|"
-        r"oui|d'accord|bien|tres|peux|peut|où|quand|comment|quoi|qui|que|"
-        r"est|suis|sommes|êtes|sont|ai|as|a|avons|avez|ont|"
-        r"je|tu|il|elle|nous|vous|ils|elles|"
-        r"ce|cet|cette|ces|mon|ton|son|ma|ta|sa)\b",
-        re.IGNORECASE,
-    ),
-}
-AMBIGUOUS = {"ok", "no", "si", "hey"}
-LANG_MARKERS = {
-    "es": re.compile(r"\b(español|castellano|hablo español|hablo espanol)\b", re.IGNORECASE),
-    "en": re.compile(r"\b(english|speak english)\b", re.IGNORECASE),
-    "fr": re.compile(r"\b(français|francais|parle français|parle francais)\b", re.IGNORECASE),
-}
 
 
 def detect_lang(text: str) -> str | None:
@@ -470,6 +434,7 @@ async def process_interaction(
     event_id: str,
     kind: str,
     detected_language: str | None = None,
+    language_evidence: dict[str, object] | None = None,
     provisional_language: str | None = None,
     reply_peer: object | None = None,
 ) -> None:
@@ -478,6 +443,7 @@ async def process_interaction(
         event_id=event_id,
         kind=kind,
         detected_language=detected_language,
+        language_evidence=language_evidence,
         provisional_language=provisional_language,
         reply_peer=reply_peer,
     )
@@ -515,11 +481,17 @@ async def handle_message(event) -> None:
     )
     if not interaction:
         return
+    language_evidence = (
+        detect_language_evidence(interaction.text) if interaction.text else None
+    )
     await process_interaction(
         chat_id=interaction.contact_id,
         event_id=interaction.event_id,
         kind=interaction.kind,
-        detected_language=detect_lang(interaction.text) if interaction.text else None,
+        detected_language=(
+            language_evidence["language"] if language_evidence else None
+        ),
+        language_evidence=language_evidence,
         provisional_language="es",
         reply_peer=interaction.reply_peer,
     )
@@ -685,7 +657,10 @@ async def main() -> None:
         except asyncio.CancelledError:
             break
         except Exception as exc:
-            logging.warning("Telegram UserBot disconnected or encountered error (%s: %s). Reconnecting in 5s...", type(exc).__name__, exc)
+            logging.warning(
+                "Telegram UserBot disconnected or encountered error (%s); reconnecting in 5s",
+                type(exc).__name__,
+            )
             await asyncio.sleep(5)
 
 

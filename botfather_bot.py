@@ -4,10 +4,10 @@ Usa python-telegram-bot. Misma lógica de idioma y pasos que el user bot.
 Requiere AUTOREPLY_BOT_TOKEN. Corre en paralelo con bot.py (Telethon).
 """
 import os
-import re
 import json
 import time
 import logging
+import hashlib
 from pathlib import Path
 
 from telegram import Update
@@ -69,35 +69,22 @@ MESSAGES = load_messages()
 # ── Estado por usuario ────────────────────────────────────────────────
 user_state: dict[int, dict] = {}
 
-# ── Detección de idioma ───────────────────────────────────────────────
-LANG_KEYWORDS = {
-    "es": re.compile(
-        r"\b(hola|gracias|por\s*favor|buenos\s*días|quiero|necesito|ayuda|habla|"
-        r"buenas|amigo|claro|vale|dale|listo|entiendo|puedes|hacer|"
-        r"dónde|cuándo|cómo|cuál|quién|eso|esto|algo|nada|todo|más|menos|"
-        r"está|estoy|estamos|están|tengo|tiene|tenemos|soy|eres|somos|son)\b",
-        re.IGNORECASE,
-    ),
-    "en": re.compile(
-        r"\b(hello|hi|thanks|thank\s*you|please|help|want|need|can\s*i|"
-        r"yes|sure|fine|good|great|hey|would|could|should|"
-        r"where|when|how|what|who|that|this|there|here|"
-        r"is|are|am|have|has|do|does|did|will|may|might)\b",
-        re.IGNORECASE,
-    ),
-    "fr": re.compile(
-        r"\b(bonjour|merci|s'il\s*vous\s*plaît|aide|besoin|vouloir|"
-        r"oui|d'accord|bien|tres|peux|peut|"
-        r"où|quand|comment|quoi|qui|que|"
-        r"est|suis|sommes|êtes|sont|ai|as|a|avons|avez|ont|"
-        r"je|tu|il|elle|nous|vous|ils|elles|"
-        r"ce|cet|cette|ces|mon|ton|son|ma|ta|sa)\b",
-        re.IGNORECASE,
-    ),
-}
 
-AMBIGUOUS = {"ok", "no", "si", "hey"}
+def _claim_message(state: dict, message: object) -> bool:
+    """Claim one Bot API message before language/step mutation."""
 
+    message_id = getattr(message, "message_id", None)
+    if message_id is None:
+        return True
+    event_key = hashlib.sha256(
+        f"botfather-event\0{message_id}".encode("utf-8", errors="strict")
+    ).hexdigest()
+    recent = state.setdefault("recent_events", [])
+    if event_key in recent:
+        return False
+    recent.append(event_key)
+    del recent[:-256]
+    return True
 
 def detect_lang(text: str) -> str | None:
     return detect_supported_language(text)
@@ -126,20 +113,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    text = (update.message.text or update.message.caption or "").strip()
 
     now = time.time()
     state = user_state.get(chat_id)
 
     if state is None or is_expired(state):
         if state is not None:
-            logging.info("[BF chat=%s] EXPIRED — new cycle", chat_id)
+            logging.info("BotFather conversation cycle expired")
         load_messages_fresh()
         state = {"step": 0, "last_seen": now}
+        if not _claim_message(state, update.message):
+            return
         apply_message_language_evidence(state, update.message)
         user_state[chat_id] = state
         step_to_use = 0
     else:
+        if not _claim_message(state, update.message):
+            logging.info("BotFather duplicate interaction ignored")
+            return
         apply_message_language_evidence(state, update.message)
         step_to_use = min(state["step"] + 1, len(MESSAGES.get(state["lang"], MESSAGES["en"])["steps"]) - 1)
         state["last_seen"] = now
@@ -163,24 +154,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     logging.info(
-        "[BF chat=%s lang=%s step=%s] %r → %r",
-        chat_id, lang, step_to_use, text[:60], msg_text[:60],
+        "BotFather message processed lang=%s step=%s",
+        lang,
+        step_to_use,
     )
 
 
 async def handle_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Voice/video note treated as call."""
     chat_id = update.effective_chat.id
-    logging.info("[BF chat=%s] VOICE/VIDEO received", chat_id)
+    logging.info("BotFather voice/video interaction received")
 
     state = user_state.get(chat_id)
     now = time.time()
     if state is None or is_expired(state):
         load_messages_fresh()
         state = {"step": 0, "last_seen": now}
+        if not _claim_message(state, update.message):
+            return
         apply_message_language_evidence(state, update.message)
         user_state[chat_id] = state
     else:
+        if not _claim_message(state, update.message):
+            logging.info("BotFather duplicate interaction ignored")
+            return
         apply_message_language_evidence(state, update.message)
         state["last_seen"] = now
     lang = state["lang"]
@@ -210,7 +207,7 @@ async def handle_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logging.error("[BF] Error: %s", context.error)
+    logging.error("[BF] Handler error (%s)", type(context.error).__name__)
 
 
 # ── Main ──────────────────────────────────────────────────────────────
@@ -238,10 +235,13 @@ def main():
             app.add_handler(MessageHandler(filters.VOICE | filters.VIDEO_NOTE, handle_call))
             app.add_error_handler(error_handler)
 
-            logging.info("BotFather bot starting... (token=%s...)", BOT_TOKEN[:8])
+            logging.info("BotFather bot starting")
             app.run_polling(allowed_updates=Update.ALL_TYPES)
         except Exception as e:
-            logging.error("[BF] BotFather bot crashed: %s. Restarting in 5s...", e)
+            logging.error(
+                "[BF] BotFather bot crashed (%s); restarting in 5s",
+                type(e).__name__,
+            )
             time.sleep(5)
 
 

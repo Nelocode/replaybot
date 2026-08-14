@@ -62,6 +62,11 @@ class TestModeStateTests(unittest.TestCase):
             current = json.loads(serialized)
             self.assertEqual(0, current["contacts"][canonical_key]["phase"])
             self.assertEqual("en", current["contacts"][canonical_key]["language"])
+            self.assertEqual(
+                "operator_seed",
+                current["contacts"][canonical_key]["language_source"],
+            )
+            self.assertIsNone(current["contacts"][canonical_key]["language_candidate"])
             self.assertEqual([], current["contacts"][canonical_key]["recent_events"])
             self.assertNotIn("573001234567", serialized)
             self.assertTrue(result["reset"])
@@ -86,6 +91,9 @@ class TestModeStateTests(unittest.TestCase):
                 {
                     "phase": 0,
                     "language": None,
+                    "language_source": None,
+                    "language_candidate": None,
+                    "language_candidate_streak": 0,
                     "recent_events": [],
                     "updated_at": 0,
                     "reset_pending": True,
@@ -162,7 +170,7 @@ process.stdout.write(JSON.stringify({ first, second }));
             self.assertEqual("step1", decisions["first"]["responseKey"])
             self.assertEqual("en", decisions["first"]["language"])
             self.assertEqual("step2", decisions["second"]["responseKey"])
-            self.assertEqual("en", decisions["second"]["language"])
+            self.assertEqual("fr", decisions["second"]["language"])
 
             serialized = state_path.read_text(encoding="utf-8")
             payload = json.loads(serialized)
@@ -200,6 +208,11 @@ process.stdout.write(JSON.stringify({ first, second }));
             self.assertTrue(result["reset"])
             self.assertEqual(0, current["contacts"]["latest"]["phase"])
             self.assertEqual("fr", current["contacts"]["latest"]["language"])
+            self.assertEqual(
+                "operator_seed",
+                current["contacts"]["latest"]["language_source"],
+            )
+            self.assertIsNone(current["contacts"]["latest"]["language_candidate"])
             self.assertEqual([], current["contacts"]["latest"]["recent_events"])
             self.assertEqual(original["aliases"], current["aliases"])
             self.assertEqual(original, backup)

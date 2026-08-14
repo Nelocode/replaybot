@@ -6,6 +6,7 @@ import path from 'path';
 
 import { createWhatsAppCallHandler } from '../wa_call_handler.mjs';
 import { PersistentInteractionState } from '../interaction_state.mjs';
+import { detectLanguageEvidence } from '../language_detection.mjs';
 
 function createHarness(overrides = {}) {
   const effects = [];
@@ -405,6 +406,7 @@ test('primera llamada usa provisional del prefijo y texto detectado puede reempl
     eventId: 'message:english',
     kind: 'content',
     detectedLanguage: 'en',
+    languageEvidence: detectLanguageEvidence('Are you available now?'),
   });
 
   assert.deepEqual(languages, [['es', 'call']]);

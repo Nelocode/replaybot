@@ -127,6 +127,9 @@ def reset_latest_interaction(
     contacts[latest_key] = {
         "phase": 0,
         "language": language,
+        "language_source": "operator_seed" if language else None,
+        "language_candidate": None,
+        "language_candidate_streak": 0,
         "recent_events": [],
         "updated_at": previous.get("updated_at", 0),
     }
@@ -205,6 +208,9 @@ def reset_whatsapp_interaction_by_number(
     contacts[canonical_key] = {
         "phase": 0,
         "language": language,
+        "language_source": "operator_seed" if language else None,
+        "language_candidate": None,
+        "language_candidate_streak": 0,
         "recent_events": [],
         "updated_at": 0,
         # The number can initially be unknown to a LID-only history.  This

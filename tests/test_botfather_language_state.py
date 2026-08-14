@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from botfather_language_state import (
     apply_language_evidence,
     apply_message_language_evidence,
+    detect_language_evidence,
     detect_supported_language,
 )
 
@@ -18,19 +19,69 @@ class BotFatherLanguageStateTests(unittest.TestCase):
         state = {}
         self.assertEqual("es", apply_language_evidence(state, detected_language=None))
         self.assertTrue(state["language_provisional"])
-        self.assertEqual("en", apply_language_evidence(state, detected_language="en"))
+        evidence = detect_language_evidence("hello")
+        self.assertEqual(
+            "en",
+            apply_language_evidence(
+                state,
+                detected_language="en",
+                language_evidence=evidence,
+            ),
+        )
         self.assertFalse(state["language_provisional"])
 
-    def test_initial_text_is_confirmed_and_does_not_keep_flipping(self):
+    def test_strong_text_immediately_replaces_confirmed_language(self):
         state = {}
-        self.assertEqual("fr", apply_language_evidence(state, detected_language="fr"))
+        french = detect_language_evidence("bonjour")
+        self.assertEqual(
+            "fr",
+            apply_language_evidence(
+                state,
+                detected_language="fr",
+                language_evidence=french,
+            ),
+        )
         self.assertFalse(state["language_provisional"])
-        self.assertEqual("fr", apply_language_evidence(state, detected_language="en"))
+        spanish = detect_language_evidence("que chicas están disponibles por Rubí")
+        self.assertEqual(
+            "es",
+            apply_language_evidence(
+                state,
+                detected_language="es",
+                language_evidence=spanish,
+            ),
+        )
+        self.assertEqual("detected", state["language_source"])
 
     def test_legacy_language_without_flag_is_confirmed(self):
         state = {"lang": "es"}
         self.assertEqual("es", apply_language_evidence(state, detected_language="en"))
         self.assertFalse(state["language_provisional"])
+
+    def test_weak_evidence_requires_two_observations_even_when_provisional(self):
+        state = {}
+        self.assertEqual("es", apply_language_evidence(state, detected_language=None))
+        weak = detect_language_evidence("want")
+        self.assertEqual(
+            "es",
+            apply_language_evidence(
+                state,
+                detected_language="en",
+                language_evidence=weak,
+            ),
+        )
+        self.assertEqual("en", state["language_candidate"])
+        self.assertTrue(state["language_provisional"])
+        self.assertEqual(
+            "en",
+            apply_language_evidence(
+                state,
+                detected_language="en",
+                language_evidence=weak,
+            ),
+        )
+        self.assertFalse(state["language_provisional"])
+        self.assertIsNone(state["language_candidate"])
 
     def test_voice_with_english_caption_confirms_english_for_call_response(self):
         state = {}

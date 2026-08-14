@@ -110,6 +110,7 @@ class TelegramInteractionDispatcher:
         event_id: str,
         kind: str,
         detected_language: str | None = None,
+        language_evidence: dict[str, object] | None = None,
         provisional_language: str | None = None,
         reply_peer: object | None = None,
     ) -> InteractionDecision:
@@ -120,6 +121,7 @@ class TelegramInteractionDispatcher:
                 event_id=event_id,
                 kind=kind,
                 detected_language=detected_language,
+                language_evidence=language_evidence,
                 provisional_language=provisional_language,
             )
             if not decision.duplicate and decision.response_key:
@@ -135,6 +137,7 @@ class TelegramInteractionDispatcher:
                     event_id=event_id,
                     kind=kind,
                     detected_language=detected_language,
+                    language_evidence=language_evidence,
                     provisional_language=provisional_language,
                 )
             return decision

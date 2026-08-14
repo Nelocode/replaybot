@@ -7,7 +7,7 @@ import path from 'path';
 import { PersistentInteractionState } from '../interaction_state.mjs';
 import { createWhatsAppMessageHandler, describeInteraction } from '../wa_message_handler.mjs';
 import { KeyedSerialQueue } from '../keyed_serial_queue.mjs';
-import { detectSupportedLanguage } from '../language_detection.mjs';
+import { detectLanguageEvidence } from '../language_detection.mjs';
 
 function incoming(id, message, overrides = {}) {
   return {
@@ -103,7 +103,7 @@ test('caption ambiguo usa prefijo provisional y texto claro posterior puede reem
       return { text: key, audio: '' };
     },
     readAudio: async () => null,
-    detectLanguage: detectSupportedLanguage,
+    detectLanguage: detectLanguageEvidence,
     logger: { info() {}, warn() {}, error() {} },
   });
 
@@ -123,6 +123,39 @@ test('caption ambiguo usa prefijo provisional y texto claro posterior puede reem
   assert.equal(contact.language_provisional, false);
 });
 
+test('WhatsApp corrige provisional francés con Mándame información', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-message-handler-'));
+  const state = new PersistentInteractionState({ filePath: path.join(directory, 'state.json') });
+  const languages = [];
+  const handler = createWhatsAppMessageHandler({
+    sendMessage: async () => {},
+    routeInteraction: details => state.register(details),
+    getResponseMessage: (language, key) => {
+      languages.push([language, key]);
+      return { text: key, audio: '' };
+    },
+    readAudio: async () => null,
+    detectLanguage: detectLanguageEvidence,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  const frenchContact = { remoteJid: '33612345678@s.whatsapp.net' };
+
+  await handler({
+    type: 'notify',
+    messages: [incoming('image-fr', { imageMessage: {} }, frenchContact)],
+  });
+  await handler({
+    type: 'notify',
+    messages: [incoming('text-es', { conversation: 'Mándame información' }, frenchContact)],
+  });
+
+  assert.deepEqual(languages, [['fr', 'step1'], ['es', 'step2']]);
+  const contact = Object.values(state.contacts)[0];
+  assert.equal(contact.language, 'es');
+  assert.equal(contact.language_source, 'detected');
+  assert.equal(contact.language_candidate, null);
+});
+
 test('texto inicial prima sobre el indicio del prefijo telefónico', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-message-handler-'));
   const state = new PersistentInteractionState({ filePath: path.join(directory, 'state.json') });
@@ -135,7 +168,7 @@ test('texto inicial prima sobre el indicio del prefijo telefónico', async () =>
       return { text: '', audio: '' };
     },
     readAudio: async () => null,
-    detectLanguage: () => 'en',
+    detectLanguage: detectLanguageEvidence,
     logger: { info() {}, warn() {}, error() {} },
   });
 
@@ -146,6 +179,42 @@ test('texto inicial prima sobre el indicio del prefijo telefónico', async () =>
 
   assert.deepEqual(languages, [['en', 'step1']]);
   assert.equal(Object.values(state.contacts)[0].language_provisional, false);
+});
+
+test('WhatsApp cambia de francés confirmado a español ante evidencia fuerte', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-message-language-override-'));
+  const state = new PersistentInteractionState({ filePath: path.join(directory, 'state.json') });
+  state.register({
+    contactId: '573001234567@s.whatsapp.net',
+    eventId: 'seed:french',
+    kind: 'content',
+    languageEvidence: detectLanguageEvidence('bonjour'),
+  });
+  const languages = [];
+  const handler = createWhatsAppMessageHandler({
+    sendMessage: async () => {},
+    routeInteraction: details => state.register(details),
+    getResponseMessage: (language, key) => {
+      languages.push([language, key]);
+      return { text: key, audio: '' };
+    },
+    readAudio: async () => null,
+    detectLanguage: detectLanguageEvidence,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  await handler({
+    type: 'notify',
+    messages: [incoming('spanish-strong', {
+      conversation: 'que chicas están disponibles por Rubí',
+    })],
+  });
+
+  assert.deepEqual(languages, [['es', 'step2']]);
+  const contact = Object.values(state.contacts)[0];
+  assert.equal(contact.language, 'es');
+  assert.equal(contact.language_source, 'detected');
+  assert.equal(contact.language_candidate, null);
 });
 
 test('envia OGG/Opus como nota de voz cuando el lector lo proporciona', async (t) => {
@@ -290,7 +359,7 @@ test('padre vacío en callback previo no consume el caption posterior', async ()
     routeInteraction: details => state.register(details),
     getResponseMessage: (_language, key) => ({ text: key, audio: '' }),
     readAudio: async () => null,
-    detectLanguage: detectSupportedLanguage,
+    detectLanguage: detectLanguageEvidence,
     logger: { info() {}, warn() {}, error() {} },
   });
   const parent = incoming('album-callbacks', {
@@ -333,7 +402,7 @@ test('caption del hijo se procesa antes que el padre vacío del mismo álbum', a
     routeInteraction: details => state.register(details),
     getResponseMessage: (_language, key) => ({ text: key, audio: '' }),
     readAudio: async () => null,
-    detectLanguage: detectSupportedLanguage,
+    detectLanguage: detectLanguageEvidence,
     logger: { info() {}, warn() {}, error() {} },
   });
   const parent = incoming('album-language', {
@@ -371,7 +440,7 @@ test('solapamiento transitivo LID a PN agrupa todo el álbum', async () => {
     routeInteraction: details => state.register(details),
     getResponseMessage: (_language, key) => ({ text: key, audio: '' }),
     readAudio: async () => null,
-    detectLanguage: detectSupportedLanguage,
+    detectLanguage: detectLanguageEvidence,
     logger: { info() {}, warn() {}, error() {} },
   });
   const parent = incoming('album-transitive', {

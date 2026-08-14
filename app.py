@@ -404,21 +404,26 @@ label { color: #c8c8e0 !important; font-weight: 500; }
         Úsalo sin tráfico real simultáneo: “más reciente” se determina por la última interacción.
       </p>
       <p id="test-mode-summary" class="small mb-3">Verifica este navegador para consultar el estado.</p>
-      <div class="d-flex align-items-center gap-2 mb-3">
-        <label for="test-mode-language" class="small mb-0">Idioma al volver a Paso 1:</label>
-        <select id="test-mode-language" class="form-select form-select-sm" style="max-width:220px;">
-          <option value="auto">Detectar por el próximo texto</option>
-          <option value="es">Español</option>
-          <option value="en">English</option>
-          <option value="fr">Français</option>
-        </select>
+      <div class="mb-3">
+        <div class="d-flex align-items-center gap-2">
+          <label for="test-mode-language" class="small mb-0">Idioma inicial al volver a Paso 1:</label>
+          <select id="test-mode-language" class="form-select form-select-sm" style="max-width:220px;">
+            <option value="auto">Detectar por el próximo texto</option>
+            <option value="es">Español</option>
+            <option value="en">English</option>
+            <option value="fr">Français</option>
+          </select>
+        </div>
+        <div class="small text-muted mt-1">
+          Una evidencia clara del cliente puede corregir este idioma; no funciona como un bloqueo permanente.
+        </div>
       </div>
       <div class="d-flex flex-wrap gap-2">
         <button id="test-mode-toggle" class="btn btn-sm btn-outline-light" onclick="toggleTestMode()" disabled>
           Activar modo de prueba
         </button>
         <button class="btn btn-sm btn-primary test-reset-button" onclick="resetTestConversation('telegram')" disabled>
-          Reiniciar última de Telegram
+          Reiniciar última del Telegram User Bot
         </button>
         <button class="btn btn-sm btn-primary test-reset-button" onclick="resetTestConversation('whatsapp')" disabled>
           Reiniciar última de WhatsApp

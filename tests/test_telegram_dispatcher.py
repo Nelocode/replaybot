@@ -6,6 +6,7 @@ import unittest
 from telethon.tl import functions, types
 
 from interaction_state import PersistentInteractionState
+from language_detection import detect_language_evidence
 from telegram_dispatcher import (
     TelegramInteractionDispatcher,
     build_telegram_media_request,
@@ -169,10 +170,80 @@ class TelegramInteractionDispatcherTests(unittest.IsolatedAsyncioTestCase):
                 event_id="message:text",
                 kind="content",
                 detected_language="en",
+                language_evidence=detect_language_evidence(
+                    "Are you available now?"
+                ),
                 provisional_language="es",
             )
 
             self.assertEqual([("step1", "es"), ("step2", "en")], deliveries)
+
+    async def test_provisional_spanish_is_replaced_by_strong_natural_french(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = PersistentInteractionState(Path(directory) / "state.json")
+            deliveries = []
+
+            async def send_response(_peer, key, language, _fingerprint):
+                deliveries.append((key, language))
+
+            dispatcher = TelegramInteractionDispatcher(state, send_response)
+            await dispatcher.dispatch(
+                chat_id=1,
+                event_id="message:image",
+                kind="content",
+                provisional_language="es",
+            )
+            evidence = detect_language_evidence(
+                "Salut, je cherche une fille disponible"
+            )
+            decision = await dispatcher.dispatch(
+                chat_id=1,
+                event_id="message:french",
+                kind="content",
+                detected_language="fr",
+                language_evidence=evidence,
+                provisional_language="es",
+            )
+
+            self.assertTrue(evidence["strong"])
+            self.assertEqual("fr", decision.language)
+            self.assertEqual([("step1", "es"), ("step2", "fr")], deliveries)
+            contact = next(iter(state._contacts.values()))
+            self.assertEqual("detected", contact["language_source"])
+            self.assertIsNone(contact["language_candidate"])
+
+    async def test_strong_spanish_evidence_overrides_confirmed_french(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = PersistentInteractionState(Path(directory) / "state.json")
+            state.register(
+                contact_id=1,
+                event_id="message:french",
+                kind="content",
+                language_evidence=detect_language_evidence("bonjour"),
+            )
+            deliveries = []
+
+            async def send_response(_peer, key, language, _fingerprint):
+                deliveries.append((key, language))
+
+            dispatcher = TelegramInteractionDispatcher(state, send_response)
+            evidence = detect_language_evidence(
+                "que chicas están disponibles por Rubí"
+            )
+            decision = await dispatcher.dispatch(
+                chat_id=1,
+                event_id="message:spanish",
+                kind="content",
+                detected_language="es",
+                language_evidence=evidence,
+                provisional_language="es",
+            )
+
+            self.assertEqual("es", decision.language)
+            self.assertEqual([("step2", "es")], deliveries)
+            contact = next(iter(state._contacts.values()))
+            self.assertEqual("detected", contact["language_source"])
+            self.assertIsNone(contact["language_candidate"])
 
     async def test_duplicate_does_not_send_a_second_response(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -23,7 +23,7 @@ import {
   readWhatsAppSafetyConfig,
   recordWhatsAppProviderSignal,
 } from './wa_delivery_safety.mjs';
-import { detectSupportedLanguage } from './language_detection.mjs';
+import { detectLanguageEvidence } from './language_detection.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BASE_DIR = path.resolve(process.env.BOT_DIR || __dirname);
@@ -228,21 +228,8 @@ if (!LINK_ONLY) {
   });
 }
 
-// ── Detección de idioma (misma lógica que bot.py) ──
-const LANG_PATTERNS = {
-  es: /\b(hola|gracias|por\s*favor|buenos\s*días|quiero|necesito|ayuda|habla|precio|precios|tarifa|tarifas|reserva|reservas|foto|fotos|vídeo|vídeos|video|videos|buenas|amigo|claro|vale|dale|listo|entiendo|puedes|hacer|dónde|cuándo|cómo|cuál|quién|eso|esto|algo|nada|todo|más|menos|está|estoy|estamos|están|tengo|tiene|tenemos|soy|eres|somos|son)\b/gi,
-  en: /\b(hello|hi|thanks|thank\s*you|please|help|want|need|can\s*i|price|prices|rate|rates|book|booking|photo|photos|video|videos|yes|sure|fine|good|great|hey|would|could|should|where|when|how|what|who|that|this|there|here|is|are|am|have|has|do|does|did|will|may|might)\b/gi,
-  fr: /\b(bonjour|merci|s'il\s*vous\s*plaît|aide|besoin|vouloir|prix|tarif|tarifs|réservation|réserver|photo|photos|vidéo|vidéos|oui|d'accord|bien|tres|peux|peut|où|quand|comment|quoi|qui|que|est|suis|sommes|êtes|sont|ai|as|a|avons|avez|ont|je|tu|il|elle|nous|vous|ils|elles|ce|cet|cette|ces|mon|ton|son|ma|ta|sa)\b/gi,
-};
-const LANG_MARKERS = {
-  es: /\b(español|castellano|hablo español|hablo espanol)\b/i,
-  en: /\b(english|speak english)\b/i,
-  fr: /\b(français|francais|parle français|parle francais)\b/i,
-};
-const AMBIGUOUS = new Set(['ok', 'no', 'si', 'hey']);
-
 function detectLang(text) {
-  return detectSupportedLanguage(text);
+  return detectLanguageEvidence(text);
 }
 
 // ── Estado por usuario ──

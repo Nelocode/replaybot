@@ -17,8 +17,13 @@ from pathlib import Path
 import time
 from typing import Callable
 
+from language_adaptation import (
+    VALID_LANGUAGES,
+    reduce_language_state,
+    sanitize_language_state,
+)
 
-VALID_LANGUAGES = frozenset({"es", "en", "fr"})
+
 VALID_KINDS = frozenset({"call", "content"})
 
 
@@ -91,12 +96,10 @@ class PersistentInteractionState:
                 if not isinstance(events, list):
                     events = []
                 events = [item for item in events if isinstance(item, str)]
+                language_state = sanitize_language_state(raw)
                 clean[contact_key] = {
                     "phase": phase,
-                    "language": language,
-                    "language_provisional": bool(
-                        language and raw.get("language_provisional") is True
-                    ),
+                    **language_state,
                     "recent_events": events[-self.max_recent_events :],
                     "updated_at": raw.get("updated_at", 0),
                 }
@@ -127,6 +130,7 @@ class PersistentInteractionState:
         event_id: object,
         kind: str,
         detected_language: str | None = None,
+        language_evidence: dict[str, object] | None = None,
         provisional_language: str | None = None,
     ) -> InteractionDecision:
         """Atomically claims an event before any outbound delivery occurs."""
@@ -137,8 +141,6 @@ class PersistentInteractionState:
             raise ValueError("event_id is required")
         if kind not in VALID_KINDS:
             raise ValueError("kind must be call or content")
-        if detected_language not in VALID_LANGUAGES:
-            detected_language = None
         if provisional_language not in VALID_LANGUAGES:
             provisional_language = None
 
@@ -148,8 +150,7 @@ class PersistentInteractionState:
         if state is None:
             state = {
                 "phase": 0,
-                "language": None,
-                "language_provisional": False,
+                **sanitize_language_state(None),
                 "recent_events": [],
                 "updated_at": 0,
             }
@@ -164,19 +165,14 @@ class PersistentInteractionState:
                 language=state.get("language") or self.default_language,
             )
 
-        language = state.get("language")
-        language_is_provisional = state.get("language_provisional") is True
-        if detected_language and (
-            language not in VALID_LANGUAGES or language_is_provisional
-        ):
-            language = detected_language
-            state["language"] = detected_language
-            state["language_provisional"] = False
-        elif language not in VALID_LANGUAGES and provisional_language:
-            language = provisional_language
-            state["language"] = provisional_language
-            state["language_provisional"] = True
-        effective_language = language or self.default_language
+        reduced_language = reduce_language_state(
+            state,
+            detected_language=detected_language,
+            language_evidence=language_evidence,
+            provisional_language=provisional_language,
+        )
+        state.update(reduced_language)
+        effective_language = state.get("language") or self.default_language
 
         previous_phase = state["phase"]
         if kind == "call":
@@ -212,6 +208,7 @@ class PersistentInteractionState:
         event_id: object,
         kind: str,
         detected_language: str | None = None,
+        language_evidence: dict[str, object] | None = None,
         provisional_language: str | None = None,
     ) -> InteractionDecision:
         """Calcula la respuesta sin consumir la interacción todavía.
@@ -226,8 +223,6 @@ class PersistentInteractionState:
             raise ValueError("event_id is required")
         if kind not in VALID_KINDS:
             raise ValueError("kind must be call or content")
-        if detected_language not in VALID_LANGUAGES:
-            detected_language = None
         if provisional_language not in VALID_LANGUAGES:
             provisional_language = None
 
@@ -236,9 +231,6 @@ class PersistentInteractionState:
         state = self._contacts.get(contact_key)
         phase = state["phase"] if state else 0
         language = state.get("language") if state else None
-        language_is_provisional = bool(
-            state and state.get("language_provisional") is True
-        )
         recent_events = state.get("recent_events", []) if state else []
         if event_key in recent_events:
             return InteractionDecision(
@@ -248,14 +240,13 @@ class PersistentInteractionState:
                 language=language or self.default_language,
             )
 
-        if detected_language and (
-            language not in VALID_LANGUAGES or language_is_provisional
-        ):
-            effective_language = detected_language
-        else:
-            effective_language = (
-                language or provisional_language or self.default_language
-            )
+        reduced_language = reduce_language_state(
+            state,
+            detected_language=detected_language,
+            language_evidence=language_evidence,
+            provisional_language=provisional_language,
+        )
+        effective_language = reduced_language["language"] or self.default_language
         if kind == "call":
             response_key = "call"
         else:
