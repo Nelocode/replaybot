@@ -37,7 +37,7 @@ if [ -f /app/data/.env.local ]; then
         env_key="${env_key%${env_key##*[![:space:]]}}"
         env_value="${env_value%$'\r'}"
         case "$env_key" in
-            TG_API_ID|TG_API_HASH|TG_PHONE|AUTOREPLY_BOT_TOKEN)
+            TG_API_ID|TG_API_HASH|TG_PHONE|AUTOREPLY_BOT_TOKEN|WA_RELINK_ENABLED|WA_RELINK_PUBLIC_BASE_URL|WA_RELINK_TELEGRAM_CHAT_ID|WA_RELINK_TELEGRAM_BOT_TOKEN|WA_RELINK_SERVICE_NAME)
                 if [[ "$env_value" == \"*\" && "$env_value" == *\" ]]; then
                     env_value="${env_value:1:${#env_value}-2}"
                 elif [[ "$env_value" == \'*\' && "$env_value" == *\' ]]; then
@@ -54,7 +54,7 @@ if [ -n "$TG_API_ID" ] && [ -n "$TG_API_HASH" ] \
    && [ -f /app/data/tg_session.session ] \
    && [ -f /app/data/tg_session_authorized.json ]; then
     echo "📱 Iniciando Bot Telegram (User Bot)..."
-    nohup env -u PANEL_ADMIN_RECOVERY_KEY python bot.py > /tmp/bot_tg.log 2>&1 &
+    nohup env -u FLASK_SECRET -u PANEL_ADMIN_RECOVERY_KEY -u BILLING_CONTROL_PLANE_ADMIN_TOKEN -u WA_RELINK_TELEGRAM_BOT_TOKEN -u AUTOREPLY_BOT_TOKEN python bot.py > /tmp/bot_tg.log 2>&1 &
     echo $! > /app/data/tg_userbot.pid
     echo "  → PID: $!"
 elif [ -n "$TG_API_ID" ] && [ -n "$TG_API_HASH" ]; then
@@ -66,7 +66,7 @@ fi
 # ── 3. Bot Telegram (BotFather - Bot API) ───────────────────────────
 if [ -n "$AUTOREPLY_BOT_TOKEN" ]; then
     echo "🤖 Iniciando BotFather Bot..."
-    nohup env -u PANEL_ADMIN_RECOVERY_KEY python botfather_bot.py > /tmp/bot_bf.log 2>&1 &
+    nohup env -u FLASK_SECRET -u PANEL_ADMIN_RECOVERY_KEY -u BILLING_CONTROL_PLANE_ADMIN_TOKEN -u WA_RELINK_TELEGRAM_BOT_TOKEN python botfather_bot.py > /tmp/bot_bf.log 2>&1 &
     echo $! > /app/data/botfather.pid
     echo "  → PID: $!"
 else
@@ -76,7 +76,7 @@ fi
 # ── 4. Bot WhatsApp ──────────────────────────────────────────────────
 if [ -d "/app/data/wa_auth" ] && [ "$(ls -A /app/data/wa_auth 2>/dev/null)" ]; then
     echo "💬 Iniciando Bot WhatsApp..."
-    nohup env -u PANEL_ADMIN_RECOVERY_KEY node wa_bot.mjs > /tmp/bot_wa.log 2>&1 &
+    nohup env -u FLASK_SECRET -u PANEL_ADMIN_RECOVERY_KEY -u BILLING_CONTROL_PLANE_ADMIN_TOKEN -u WA_RELINK_TELEGRAM_BOT_TOKEN -u AUTOREPLY_BOT_TOKEN node wa_bot.mjs > /tmp/bot_wa.log 2>&1 &
     echo $! > /app/data/wa_bot.pid
     echo "  → PID: $!"
 else

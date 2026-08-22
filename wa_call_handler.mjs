@@ -67,6 +67,7 @@ export function createWhatsAppCallHandler({
   getResponseMessage = null,
   routeInteraction = null,
   resolveContactId = async (jid) => jid,
+  interactionAllowed = () => true,
   deliveryAllowed = () => true,
   serializeClaim = async operation => operation(),
   serializeInteraction = async (_contactId, operation) => operation(),
@@ -94,6 +95,9 @@ export function createWhatsAppCallHandler({
   }
   if (typeof resolveContactId !== 'function') {
     throw new TypeError('resolveContactId debe ser una función');
+  }
+  if (typeof interactionAllowed !== 'function') {
+    throw new TypeError('interactionAllowed debe ser una función');
   }
   if (typeof deliveryAllowed !== 'function') {
     throw new TypeError('deliveryAllowed must be a function');
@@ -187,6 +191,26 @@ export function createWhatsAppCallHandler({
     if (call.isGroup) {
       logger.info?.('[WA CALL] Group call ignored');
       return finish(call, { status: 'ignored', reason: 'group_call' }, 'group_call');
+    }
+
+    try {
+      const pendingAllowed = interactionAllowed();
+      const allowed = pendingAllowed && typeof pendingAllowed.then === 'function'
+        ? await pendingAllowed
+        : pendingAllowed;
+      if (!allowed) {
+        return finish(
+          call,
+          { status: 'ignored', reason: 'interaction_blocked' },
+          'interaction_blocked',
+        );
+      }
+    } catch {
+      return finish(
+        call,
+        { status: 'ignored', reason: 'interaction_blocked' },
+        'interaction_blocked',
+      );
     }
 
     const currentTime = now();

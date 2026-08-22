@@ -247,3 +247,142 @@ test('operator pause cannot consume the later socket-close release of an unknown
   const result = await outcome;
   assert.match(result.error.message, /send_timeout/);
 });
+
+test('diagnostic callbacks emit only allowlisted private signals and never affect delivery', async (t) => {
+  const diagnostics = [];
+  const onDiagnostic = diagnostic => diagnostics.push(diagnostic);
+
+  const forbiddenHarness = createHarness(t);
+  assert.equal(recordWhatsAppProviderSignal({
+    statusCode: 403,
+    health: forbiddenHarness.health,
+    config: forbiddenHarness.config,
+    now: forbiddenHarness.now,
+    attempt: 3,
+    onDiagnostic,
+  }), 'forbidden');
+
+  const limitedHarness = createHarness(t);
+  assert.equal(recordWhatsAppProviderSignal({
+    statusCode: 429,
+    health: limitedHarness.health,
+    config: limitedHarness.config,
+    now: limitedHarness.now,
+    attempt: 2,
+    onDiagnostic,
+  }), 'rate_limited');
+
+  const failureHarness = createHarness(t, { presenceEnabled: false });
+  const privateFailure = new Error('private provider response');
+  privateFailure.payload = { jid: '573001234567@s.whatsapp.net', text: 'secret text' };
+  const failureSafety = createWhatsAppDeliverySafety({
+    ...failureHarness,
+    sendMessage: async () => { throw privateFailure; },
+    onDiagnostic,
+  });
+  await assert.rejects(
+    failureSafety.send('573001234567@s.whatsapp.net', { text: 'secret text' }),
+    error => error === privateFailure,
+  );
+
+  const rateHarness = createHarness(t, {
+    presenceEnabled: false,
+    maxSendsPerMinute: 1,
+  });
+  const rateSafety = createWhatsAppDeliverySafety({
+    ...rateHarness,
+    sendMessage: async () => {},
+    onDiagnostic,
+  });
+  await rateSafety.send('contact-a', { text: 'one' });
+  await assert.rejects(
+    rateSafety.send('contact-b', { text: 'two' }),
+    error => error instanceof WhatsAppDeliveryBlockedError && error.code === 'local_rate_limit',
+  );
+
+  const fullHarness = createHarness(t, {
+    presenceEnabled: false,
+    maxPendingSends: 1,
+  });
+  let releaseFullQueue;
+  const fullQueueGate = new Promise(resolve => { releaseFullQueue = resolve; });
+  const fullSafety = createWhatsAppDeliverySafety({
+    ...fullHarness,
+    sendMessage: async () => fullQueueGate,
+    onDiagnostic,
+  });
+  const pendingSend = fullSafety.send('contact-a', { text: 'one' });
+  await assert.rejects(
+    fullSafety.send('contact-b', { text: 'two' }),
+    error => error instanceof WhatsAppDeliveryBlockedError && error.code === 'queue_full',
+  );
+  releaseFullQueue();
+  await pendingSend;
+
+  const expiredHarness = createHarness(t, {
+    presenceEnabled: false,
+    textDelayMinMs: 2_000,
+    textDelayMaxMs: 2_000,
+    queueWaitTimeoutMs: 1_000,
+  });
+  const expiredSafety = createWhatsAppDeliverySafety({
+    ...expiredHarness,
+    sendMessage: async () => {},
+    onDiagnostic,
+  });
+  const expiredResults = await Promise.allSettled([
+    expiredSafety.send('contact-a', { text: 'one' }),
+    expiredSafety.send('contact-b', { text: 'two' }),
+  ]);
+  assert.equal(expiredResults[1].status, 'rejected');
+  assert.equal(expiredResults[1].reason.code, 'queue_timeout');
+
+  const timeoutHarness = createHarness(t, {
+    presenceEnabled: false,
+    sendTimeoutMs: 10,
+  });
+  let releaseTimedOutSend;
+  let announceTimedOutSendStarted;
+  const timeoutGate = new Promise(resolve => { releaseTimedOutSend = resolve; });
+  const timeoutStarted = new Promise(resolve => { announceTimedOutSendStarted = resolve; });
+  const timeoutSafety = createWhatsAppDeliverySafety({
+    ...timeoutHarness,
+    sendMessage: async () => {
+      announceTimedOutSendStarted();
+      return timeoutGate;
+    },
+    onDiagnostic,
+  });
+  const timedOutSend = timeoutSafety.send('contact-a', { text: 'one' });
+  await timeoutStarted;
+  await new Promise(resolve => setTimeout(resolve, 25));
+  releaseTimedOutSend();
+  await assert.rejects(timedOutSend, /send_timeout/);
+
+  assert.deepEqual(diagnostics, [
+    { type: 'provider_forbidden', statusCode: 403, attempt: 3 },
+    { type: 'provider_rate_limited', statusCode: 429, attempt: 2 },
+    { type: 'delivery_failure' },
+    { type: 'local_rate_limit' },
+    { type: 'queue_full' },
+    { type: 'queue_timeout' },
+    { type: 'delivery_timeout' },
+  ]);
+  const encoded = JSON.stringify(diagnostics);
+  assert.doesNotMatch(encoded, /573001234567|@s\.whatsapp\.net|secret text|private provider response|payload|jid/);
+  for (const diagnostic of diagnostics) {
+    assert.ok(Object.keys(diagnostic).every(key => ['type', 'statusCode', 'attempt'].includes(key)));
+  }
+
+  const isolatedHarness = createHarness(t, { presenceEnabled: false });
+  const originalError = new Error('original delivery failure');
+  const isolatedSafety = createWhatsAppDeliverySafety({
+    ...isolatedHarness,
+    sendMessage: async () => { throw originalError; },
+    onDiagnostic() { throw new Error('diagnostic callback failed'); },
+  });
+  await assert.rejects(
+    isolatedSafety.send('contact-a', { text: 'one' }),
+    error => error === originalError,
+  );
+});

@@ -132,6 +132,15 @@ function waitForSettlementOrAbort(promise, signal) {
   });
 }
 
+function emitDiagnostic(onDiagnostic, diagnostic) {
+  try {
+    const pending = onDiagnostic(diagnostic);
+    if (pending && typeof pending.catch === 'function') pending.catch(() => {});
+  } catch {
+    // Optional diagnostics must never change delivery behavior.
+  }
+}
+
 export class WhatsAppDeliveryBlockedError extends Error {
   constructor(code) {
     super(code);
@@ -147,6 +156,7 @@ export function recordWhatsAppProviderSignal({
   now = () => Date.now(),
   attempt = 1,
   cancelPending = () => {},
+  onDiagnostic = () => {},
 } = {}) {
   const parsedStatus = Number.parseInt(String(statusCode ?? ''), 10);
   if (parsedStatus === 403) {
@@ -154,6 +164,11 @@ export function recordWhatsAppProviderSignal({
     health.setCircuitOpenUntil(now() + config.forbiddenCircuitOpenMs);
     health.setOperatorPaused(true);
     cancelPending('provider_forbidden');
+    emitDiagnostic(onDiagnostic, {
+      type: 'provider_forbidden',
+      statusCode: 403,
+      attempt: boundedInteger(attempt, 1, 1, 10_000),
+    });
     return 'forbidden';
   }
   if (parsedStatus === 429) {
@@ -164,6 +179,11 @@ export function recordWhatsAppProviderSignal({
     );
     health.setBackoffUntil(now() + duration);
     cancelPending('provider_rate_limited');
+    emitDiagnostic(onDiagnostic, {
+      type: 'provider_rate_limited',
+      statusCode: 429,
+      attempt: boundedInteger(attempt, 1, 1, 10_000),
+    });
     return 'rate_limited';
   }
   return null;
@@ -183,6 +203,7 @@ export function createWhatsAppDeliverySafety({
   random = Math.random,
   sleep = defaultSleep,
   logger = console,
+  onDiagnostic = () => {},
 } = {}) {
   if (typeof sendMessage !== 'function') throw new TypeError('sendMessage is required');
   if (!health || typeof health.record !== 'function') throw new TypeError('health is required');
@@ -310,6 +331,7 @@ export function createWhatsAppDeliverySafety({
       return;
     }
     health.record('delivery_failure');
+    emitDiagnostic(onDiagnostic, { type: 'delivery_failure' });
     const recentFailures = health.recentEventTimes(
       'delivery_failure',
       config.failureWindowMs,
@@ -328,6 +350,7 @@ export function createWhatsAppDeliverySafety({
       now,
       attempt,
       cancelPending: cancelAll,
+      onDiagnostic,
     }) !== null;
   }
 
@@ -337,6 +360,7 @@ export function createWhatsAppDeliverySafety({
     if (outgoing.length >= config.maxSendsPerMinute) {
       health.record('local_rate_limit');
       health.setBackoffUntil(now() + config.backoffBaseMs);
+      emitDiagnostic(onDiagnostic, { type: 'local_rate_limit' });
       throw new WhatsAppDeliveryBlockedError('local_rate_limit');
     }
     const remaining = config.minimumSendIntervalMs - (now() - lastSendStartedAt);
@@ -393,6 +417,7 @@ export function createWhatsAppDeliverySafety({
           // overtake the next response.
           health.record('delivery_failure');
           health.setCircuitOpenUntil(now() + config.circuitOpenMs);
+          emitDiagnostic(onDiagnostic, { type: 'delivery_timeout' });
           const finalOutcome = await waitForSettlementOrAbort(
             transportPromise,
             transportController.signal,
@@ -438,6 +463,7 @@ export function createWhatsAppDeliverySafety({
     }
     if (pendingSends >= config.maxPendingSends) {
       health.record('local_rate_limit');
+      emitDiagnostic(onDiagnostic, { type: 'queue_full' });
       return Promise.reject(new WhatsAppDeliveryBlockedError('queue_full'));
     }
     pendingSends += 1;
@@ -454,6 +480,7 @@ export function createWhatsAppDeliverySafety({
         }
         if (now() - queuedAt > config.queueWaitTimeoutMs) {
           health.record('local_rate_limit');
+          emitDiagnostic(onDiagnostic, { type: 'queue_timeout' });
           throw new WhatsAppDeliveryBlockedError('queue_timeout');
         }
         return await sendSerialized(jid, content);

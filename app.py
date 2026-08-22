@@ -42,6 +42,22 @@ from test_mode import (
     save_test_mode,
 )
 from wa_safety import public_wa_safety_health, set_wa_operator_paused
+from wa_incident_health import public_wa_incident_health, read_wa_incident_history
+from billing_entitlement import billing_gate
+from wa_relink_incident import (
+    RelinkStateCorrupt,
+    RelinkStateError,
+    RelinkTokenError,
+    WhatsAppRelinkIncidentStore,
+    relink_capability_digest,
+    relink_outage_fingerprint,
+)
+from wa_relink_notifier import (
+    RelinkConfigurationError,
+    RelinkNotificationError,
+    TelegramRelinkNotifier,
+    WhatsAppRelinkConfig,
+)
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
@@ -51,6 +67,12 @@ DEFAULT_MESSAGES_FILE = BASE_DIR / "messages.json"
 WA_CALL_HEALTH_FILE = DATA_DIR / "wa_call_health.json"
 WA_SAFETY_HEALTH_FILE = DATA_DIR / "wa_safety_health.json"
 WA_SAFETY_CONTROL_FILE = DATA_DIR / "wa_safety_control.json"
+WA_INCIDENT_HEALTH_FILE = Path(
+    os.environ.get("WA_INCIDENT_HEALTH_FILE") or DATA_DIR / "wa_incident_health.json"
+)
+WA_INCIDENT_LEDGER_FILE = Path(
+    os.environ.get("WA_INCIDENT_LEDGER_FILE") or DATA_DIR / "wa_incidents.jsonl"
+)
 WA_SAFETY_STALE_AFTER_MS = 90_000
 TG_SESSION_BASE = DATA_DIR / "tg_session"
 TG_SWITCH_SESSION_BASE = DATA_DIR / "tg_switch_session"
@@ -65,6 +87,7 @@ WA_SWITCH_IDENTITY_FILE = WA_SWITCH_DIR / "identity.json"
 WA_SWITCH_PID_FILE = WA_SWITCH_DIR / "worker.pid"
 WA_SWITCH_OPERATION_FILE = WA_SWITCH_DIR / "operation.json"
 WA_SWITCH_RECOVERY_ROOT = DATA_DIR / ".wa_switch_recovery"
+WA_RELINK_DIR = DATA_DIR / "wa_relink"
 PANEL_ADMIN_ACCESS_DIR = DATA_DIR / "panel_admin_access"
 OPERATOR_ADMIN_ACCESS_DIR = PANEL_ADMIN_ACCESS_DIR / "operator"
 TG_AUDIO_BRANDING_DEFAULTS_FILE = BASE_DIR / "telegram_audio_branding.defaults.json"
@@ -113,6 +136,7 @@ _operator_admin_recovery = OperatorAdminRecoveryGuard(
     OPERATOR_ADMIN_ACCESS_DIR,
     APP_SECRET,
 )
+_wa_relink_store = WhatsAppRelinkIncidentStore(WA_RELINK_DIR, APP_SECRET)
 
 # ── Telethon auth state (para flujo interactivo desde el panel) ──────
 # Conserva un solo event loop entre send_code_request, sign_in y 2FA.
@@ -123,7 +147,9 @@ _wa_process_lock = threading.RLock()
 _wa_switch_lock = threading.RLock()
 _test_mode_lock = threading.RLock()
 _wa_safety_lock = threading.RLock()
+_wa_relink_lock = threading.RLock()
 _wa_switch_expiry_timer: threading.Timer | None = None
+_wa_relink_config_warning_emitted = False
 
 # ── HTML Template (todo en uno para portabilidad) ───────────────────
 TEMPLATE = r"""<!DOCTYPE html>
@@ -212,6 +238,84 @@ label { color: #c8c8e0 !important; font-weight: 500; }
            target="_blank" rel="noopener noreferrer">Estado oficial</a>
         <a class="btn btn-sm btn-outline-light" href="https://business.whatsapp.com/policy"
            target="_blank" rel="noopener noreferrer">Políticas</a>
+      </div>
+    </div>
+  </div>
+
+  <div id="wa-incident-card" class="card" aria-live="polite">
+    <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+      <span>🩺 Salud e incidentes de WhatsApp</span>
+      <span id="wa-incident-condition-badge" class="badge bg-secondary">Verificando...</span>
+    </div>
+    <div class="card-body">
+      <p id="wa-incident-summary" class="mb-3">Consultando telemetría preventiva...</p>
+      <div class="row g-2">
+        <div class="col-md-3"><strong>Probabilidad:</strong> <span id="wa-incident-likelihood">Sin datos</span></div>
+        <div class="col-md-3"><strong>Conexión:</strong> <span id="wa-incident-connection">Sin datos</span></div>
+        <div class="col-md-3"><strong>Telemetría:</strong> <span id="wa-incident-telemetry">Sin datos</span></div>
+        <div class="col-md-3"><strong>Integridad:</strong> <span id="wa-incident-integrity">Sin datos</span></div>
+      </div>
+      <div class="row g-3 mt-1">
+        <div class="col-md-6">
+          <strong>Señales preventivas</strong>
+          <ul id="wa-incident-signals" class="small mb-0"><li>Verificando...</li></ul>
+        </div>
+        <div class="col-md-6">
+          <strong>Modos probables de falla</strong>
+          <ul id="wa-incident-modes" class="small mb-0"><li>Verificando...</li></ul>
+        </div>
+      </div>
+      <div id="wa-incident-admin-details" class="mt-3" style="display:none;">
+        <strong>Causa exacta más reciente:</strong>
+        <span id="wa-incident-exact-cause">Sin incidentes registrados</span>
+        <div id="wa-incident-exact-time" class="small mt-1"></div>
+      </div>
+      <p id="wa-incident-action" class="small mt-3 mb-2"></p>
+      <div class="d-flex flex-wrap gap-2">
+        <button id="wa-incident-review-btn" class="btn btn-sm btn-outline-light" onclick="showSetup()">Revisar configuración</button>
+        <button id="wa-incident-pause-btn" class="btn btn-sm btn-outline-warning" onclick="setWaOutboundPaused(true)" disabled>Pausar envíos manualmente</button>
+        <button id="wa-incident-history-btn" class="btn btn-sm btn-outline-light" onclick="loadWaIncidentHistory()" disabled>Ver historial verificado</button>
+      </div>
+      <div id="wa-incident-history" class="mt-3" style="display:none;">
+        <strong>Historial forense reciente</strong>
+        <div id="wa-incident-history-status" class="small mt-1"></div>
+        <ul id="wa-incident-history-list" class="small mb-0"></ul>
+      </div>
+    </div>
+  </div>
+
+  <div id="billing-card" class="card" style="display:none;">
+    <div class="card-header d-flex justify-content-between align-items-center">
+      <span>💳 Suscripción de los seis bots</span>
+      <span id="billing-status-badge" class="badge bg-secondary">Verificando...</span>
+    </div>
+    <div class="card-body">
+      <div class="row g-3 align-items-center">
+        <div class="col-md-7">
+          <div><strong>€250 al mes</strong> · impuestos gestionados externamente</div>
+          <div id="billing-period-text" class="small mt-1">Consultando período pagado...</div>
+          <div id="billing-control-text" class="small mt-1"></div>
+        </div>
+        <div class="col-md-5 d-flex flex-wrap justify-content-md-end gap-2">
+          <button id="billing-pay-btn" class="btn btn-sm btn-primary" onclick="runBillingAction('checkout')">Pagar mensualidad</button>
+          <button id="billing-portal-btn" class="btn btn-sm btn-outline-light" onclick="runBillingAction('portal')">Administrar pago</button>
+          <button id="billing-override-btn" class="btn btn-sm btn-outline-warning" onclick="createBillingOverride()">Excepción temporal</button>
+        </div>
+      </div>
+      <div class="row g-2 mt-2">
+        <div class="col-md-4">
+          <label for="billing-method-select" class="small">Método de pago</label>
+          <select id="billing-method-select" class="form-select form-select-sm" onchange="renderBillingPayerFields()"></select>
+        </div>
+        <div id="billing-payer-fields" class="col-md-8" style="display:none;">
+          <div class="row g-2">
+            <div class="col-sm-3"><input id="billing-payer-name" class="form-control form-control-sm" maxlength="120" autocomplete="name" placeholder="Nombre"></div>
+            <div class="col-sm-3"><input id="billing-payer-email" type="email" class="form-control form-control-sm" maxlength="160" autocomplete="email" placeholder="Correo"></div>
+            <div class="col-sm-3"><input id="billing-payer-document" class="form-control form-control-sm" maxlength="32" autocomplete="off" placeholder="Documento"></div>
+            <div class="col-sm-3"><input id="billing-payer-phone" class="form-control form-control-sm" maxlength="32" autocomplete="tel" placeholder="Teléfono (si aplica)"></div>
+          </div>
+          <div class="small text-muted mt-1">Se envían directamente al procesador para crear el pago y no se guardan en este proyecto.</div>
+        </div>
       </div>
     </div>
   </div>
@@ -992,6 +1096,383 @@ async function updateWaStatus(running) {
     el.className = "badge bg-secondary";
     el.innerHTML = '💬 WA: Incierto';
     if (!waSwitchPolling) qrCard.style.display = 'none';
+  }
+}
+
+function billingDate(value) {
+  if (!value) return "sin fecha registrada";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "fecha no disponible" : date.toLocaleString();
+}
+
+let billingMethods = [];
+
+function renderBillingPayerFields() {
+  const select = document.getElementById("billing-method-select");
+  const method = billingMethods.find(item => item.id === select.value);
+  const fields = document.getElementById("billing-payer-fields");
+  fields.style.display = method && method.requires_payer ? "block" : "none";
+  document.getElementById("billing-payer-phone").required = Boolean(method && method.requires_phone);
+}
+
+function renderBillingMethods(methods) {
+  billingMethods = Array.isArray(methods) ? methods : [];
+  const select = document.getElementById("billing-method-select");
+  const previous = select.value;
+  select.replaceChildren();
+  for (const method of billingMethods) {
+    const option = document.createElement("option");
+    option.value = method.id;
+    option.textContent = `${method.label} · ${method.customer_currency}`;
+    select.appendChild(option);
+  }
+  if (!billingMethods.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "Pendiente de aprobación/configuración";
+    select.appendChild(option);
+  } else if (billingMethods.some(item => item.id === previous)) {
+    select.value = previous;
+  }
+  renderBillingPayerFields();
+}
+
+async function loadBillingStatus() {
+  const card = document.getElementById("billing-card");
+  const badge = document.getElementById("billing-status-badge");
+  const period = document.getElementById("billing-period-text");
+  const control = document.getElementById("billing-control-text");
+  try {
+    const response = await fetch("/api/billing/status", {cache: "no-store"});
+    if (response.status === 403) {
+      card.style.display = "none";
+      return;
+    }
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error("Estado de cobro no disponible");
+    card.style.display = "block";
+    const billing = data.billing || {};
+    const state = billing.status || "unavailable";
+    const labels = {
+      trialing: "Prueba activa",
+      active: "Pagado",
+      grace: "En gracia",
+      suspended: "Suspendido",
+      canceled: "Cancelado",
+      unavailable: "Sin conexión",
+    };
+    badge.textContent = labels[state] || "Estado desconocido";
+    badge.className = "badge " + (
+      state === "active" || state === "trialing" ? "bg-success" :
+      state === "grace" ? "bg-warning text-dark" : "bg-danger"
+    );
+    period.textContent = billing.paid_through
+      ? `Período pagado hasta ${billingDate(billing.paid_through)}`
+      : state === "trialing" ? "Prueba inicial de siete días" : "No hay un período pagado vigente";
+    if (billing.grace_until) period.textContent += ` · gracia hasta ${billingDate(billing.grace_until)}`;
+    if (billing.override_until) period.textContent += ` · excepción hasta ${billingDate(billing.override_until)}`;
+    control.textContent = data.control_plane_available
+      ? (data.local && data.local.enforcement ? "Control automático habilitado" : "Modo sombra: todavía no bloquea bots")
+      : "Control plane no disponible; se aplica la caché firmada local";
+    renderBillingMethods(data.payment_methods);
+    document.getElementById("billing-pay-btn").disabled = billingMethods.length === 0;
+    document.getElementById("billing-portal-btn").disabled = !data.control_plane_available || !billing.provider_customer_configured;
+  } catch (error) {
+    card.style.display = "block";
+    badge.textContent = "No disponible";
+    badge.className = "badge bg-danger";
+    period.textContent = "No se pudo verificar el estado de la mensualidad.";
+    control.textContent = "El panel sigue disponible para recuperación administrativa.";
+  }
+}
+
+async function runBillingAction(action) {
+  try {
+    const payload = {};
+    if (action === "checkout") {
+      const methodId = document.getElementById("billing-method-select").value;
+      const method = billingMethods.find(item => item.id === methodId);
+      if (!method) throw new Error("No hay un método aprobado y configurado");
+      payload.method_id = methodId;
+      if (method.requires_payer) {
+        const payer = {
+          name: document.getElementById("billing-payer-name").value.trim(),
+          email: document.getElementById("billing-payer-email").value.trim(),
+          document: document.getElementById("billing-payer-document").value.trim(),
+          phone: document.getElementById("billing-payer-phone").value.trim(),
+        };
+        if (!payer.name || !payer.email.includes("@") || !payer.document || (method.requires_phone && !payer.phone)) {
+          throw new Error("Completa los datos requeridos por el procesador");
+        }
+        payload.payer = payer;
+      }
+    }
+    const response = await fetch(`/api/billing/${action}`, {
+      method: "POST",
+      headers: channelHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error("Acción de pago no disponible");
+    if (data.url) window.location.assign(data.url);
+    else if (data.action === "await_provider_confirmation") toast("Pago creado; confirma la solicitud en el proveedor", "success");
+    else throw new Error("El proveedor no devolvió una acción válida");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+async function createBillingOverride() {
+  const hoursRaw = prompt("Duración de la excepción en horas (máximo 24):", "1");
+  if (hoursRaw === null) return;
+  const hours = Number(hoursRaw);
+  const reason = prompt("Motivo operativo auditado (mínimo 8 caracteres):", "");
+  if (reason === null) return;
+  if (!Number.isFinite(hours) || hours <= 0 || hours > 24 || reason.trim().length < 8) {
+    toast("Duración o motivo inválido", "error");
+    return;
+  }
+  try {
+    const response = await fetch("/api/billing/override", {
+      method: "POST",
+      headers: channelHeaders(),
+      body: JSON.stringify({reason: reason.trim(), duration_seconds: Math.round(hours * 3600)}),
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error("No fue posible crear la excepción");
+    toast("Excepción temporal registrada", "success");
+    await loadBillingStatus();
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+let waIncidentHealthRequest = null;
+
+function waIncidentStatusLabel(value) {
+  const labels = {
+    auth_unregistered: "Autenticación no registrada",
+    auth_write_failure: "Fallo al guardar autenticación",
+    bad_session: "Sesión dañada",
+    connection_closed: "Conexión cerrada",
+    connection_lost_or_timeout: "Conexión perdida o tiempo agotado",
+    connection_replaced: "Conexión reemplazada por otra sesión",
+    connection_timeout: "Tiempo de conexión agotado",
+    delivery_failure: "Fallo de entrega",
+    delivery_timeout: "Tiempo de entrega agotado",
+    forbidden: "Acceso prohibido por el proveedor",
+    local_rate_limit: "Límite local activado",
+    logged_out: "Sesión cerrada",
+    multidevice_mismatch: "Desajuste multidispositivo",
+    provider_forbidden: "Restricción del proveedor",
+    provider_rate_limited: "Límite del proveedor",
+    queue_full: "Cola llena",
+    queue_timeout: "Espera de cola agotada",
+    restart_required: "Reinicio de conexión requerido",
+    service_unavailable: "Servicio del proveedor no disponible",
+    slow_connect: "Conexión lenta",
+    startup_failure: "Fallo de arranque",
+    worker_lease_conflict: "Otro worker usa la sesión",
+    worker_shutdown: "Worker detenido",
+    unknown: "Causa desconocida",
+  };
+  return labels[value] || labels.unknown;
+}
+
+function replaceWaIncidentList(elementId, values, labels, emptyText) {
+  const list = document.getElementById(elementId);
+  list.replaceChildren();
+  const safeValues = Array.isArray(values) ? values : [];
+  if (!safeValues.length) {
+    const item = document.createElement("li");
+    item.textContent = emptyText;
+    list.appendChild(item);
+    return;
+  }
+  for (const value of safeValues) {
+    const item = document.createElement("li");
+    item.textContent = labels[value] || "Señal operativa no clasificada";
+    list.appendChild(item);
+  }
+}
+
+function renderWaIncidentHealth(data) {
+  const card = document.getElementById("wa-incident-card");
+  const badge = document.getElementById("wa-incident-condition-badge");
+  const condition = data && data.available ? data.condition : "unknown";
+  const likelihood = data && data.failure_likelihood ? data.failure_likelihood : "unknown";
+  const conditionLabels = {
+    starting: "Iniciando", healthy: "Saludable", warning: "Advertencia",
+    degraded: "Degradado", critical: "Crítico", unknown: "Sin telemetría",
+  };
+  const conditionClasses = {
+    starting: "badge bg-info text-dark", healthy: "badge bg-success",
+    warning: "badge bg-warning text-dark", degraded: "badge bg-warning text-dark",
+    critical: "badge bg-danger", unknown: "badge bg-secondary",
+  };
+  const likelihoodLabels = {low: "Baja", elevated: "Elevada", high: "Alta", unknown: "Sin datos"};
+  const connectionLabels = {
+    starting: "Iniciando", connecting: "Conectando", open: "Abierta",
+    closed: "Cerrada", unknown: "Desconocida",
+  };
+  const integrityLabels = {
+    verified: "Verificada", invalid: "Inválida", unavailable: "No disponible", unknown: "Sin datos",
+  };
+  const signalLabels = {
+    auth_unregistered: "Autenticación no registrada",
+    auth_write_failure: "Fallo al guardar autenticación",
+    backoff_active: "Espera preventiva activa",
+    circuit_open: "Circuit breaker abierto",
+    connection_timeout: "Tiempo de conexión agotado",
+    connection_unstable: "Conexión inestable",
+    delivery_failures: "Fallos repetidos de entrega",
+    frequent_reconnects: "Reconexiones frecuentes",
+    ledger_integrity_invalid: "Integridad forense inválida",
+    local_rate_limit: "Límite local activado",
+    operator_paused: "Pausa administrativa activa",
+    provider_forbidden: "Restricción del proveedor",
+    provider_rate_limited: "Límite del proveedor",
+    slow_connect: "Conexión lenta",
+    startup_failure: "Fallo de arranque",
+    terminal_session_failure: "Falla terminal de sesión",
+    worker_lease_conflict: "Posible worker duplicado",
+  };
+  const modeLabels = {
+    authentication_loss: "Pérdida de autenticación",
+    delivery_suspension: "Suspensión de entregas",
+    duplicate_session: "Sesión duplicada",
+    local_protection: "Protección local activada",
+    provider_restriction: "Restricción del proveedor",
+    rate_limit: "Límite de uso",
+    session_mismatch: "Desajuste de sesión",
+    transport_instability: "Inestabilidad de transporte",
+    unknown: "Causa aún no determinada",
+  };
+
+  badge.className = conditionClasses[condition] || conditionClasses.unknown;
+  badge.textContent = conditionLabels[condition] || conditionLabels.unknown;
+  card.className = condition === "critical"
+    ? "card border-danger"
+    : (["warning", "degraded"].includes(condition) || ["elevated", "high"].includes(likelihood))
+      ? "card border-warning"
+      : "card";
+  document.getElementById("wa-incident-likelihood").textContent = likelihoodLabels[likelihood] || likelihoodLabels.unknown;
+  document.getElementById("wa-incident-connection").textContent = connectionLabels[data?.connection] || connectionLabels.unknown;
+  document.getElementById("wa-incident-telemetry").textContent = data?.telemetry_fresh
+    ? (data.worker_running ? "Fresca · worker activo" : "Fresca · worker detenido")
+    : (data?.worker_running ? "Vencida · worker activo" : "Vencida · worker detenido");
+  document.getElementById("wa-incident-integrity").textContent = integrityLabels[data?.ledger_integrity] || integrityLabels.unknown;
+  replaceWaIncidentList("wa-incident-signals", data?.signals, signalLabels, "Sin señales preventivas activas");
+  replaceWaIncidentList("wa-incident-modes", data?.likely_failure_modes, modeLabels, "Sin modos de falla probables");
+
+  const canManage = Boolean(data && data.can_manage);
+  const details = data?.active_incident || data?.last_failure || data?.last_incident || null;
+  const adminDetails = document.getElementById("wa-incident-admin-details");
+  adminDetails.style.display = canManage ? "block" : "none";
+  document.getElementById("wa-incident-history-btn").disabled = !canManage;
+  document.getElementById("wa-incident-pause-btn").disabled = !canManage;
+  if (canManage) {
+    const cause = document.getElementById("wa-incident-exact-cause");
+    const exactTime = document.getElementById("wa-incident-exact-time");
+    if (details) {
+      const code = Number.isInteger(details.status_code) ? ` · código ${details.status_code}` : "";
+      cause.textContent = `${waIncidentStatusLabel(details.status_name)}${code}`;
+      const at = details.last_event_at || details.at || details.started_at;
+      exactTime.textContent = Number.isFinite(at)
+        ? `Registrado: ${new Date(at).toLocaleString()}`
+        : "Hora exacta no disponible";
+    } else {
+      cause.textContent = "Sin incidentes registrados";
+      exactTime.textContent = "";
+    }
+  }
+
+  const summary = document.getElementById("wa-incident-summary");
+  const action = document.getElementById("wa-incident-action");
+  if (condition === "critical") {
+    summary.textContent = "Existe un incidente crítico que requiere revisión humana antes de recuperar la sesión.";
+    action.textContent = "Consulta la causa exacta y el historial; no reinicies ni revincules sin revisar primero el diagnóstico.";
+  } else if (["warning", "degraded"].includes(condition) || ["elevated", "high"].includes(likelihood)) {
+    summary.textContent = "Hay señales preventivas que pueden anticipar una interrupción de WhatsApp.";
+    action.textContent = "Revisa ahora las señales, la configuración y el historial; puedes pausar manualmente los envíos mientras investigas.";
+  } else if (condition === "healthy") {
+    summary.textContent = "La conexión está estable y no hay señales preventivas activas.";
+    action.textContent = "Continúa observando la telemetría; algunos cierres del proveedor pueden ocurrir sin aviso previo.";
+  } else {
+    summary.textContent = "No hay telemetría fresca suficiente para confirmar la salud de WhatsApp.";
+    action.textContent = "Verifica el worker y la conexión antes de asumir que el servicio está operativo.";
+  }
+}
+
+async function loadWaIncidentHealth(force=false) {
+  if (waIncidentHealthRequest && force) await waIncidentHealthRequest;
+  if (waIncidentHealthRequest) return waIncidentHealthRequest;
+  waIncidentHealthRequest = (async () => {
+    try {
+      const response = await fetch("/api/wa_incident_health", {cache: "no-store"});
+      const data = await response.json();
+      if (!response.ok) throw new Error("No se pudo consultar la salud de incidentes");
+      renderWaIncidentHealth(data);
+      return data;
+    } catch {
+      renderWaIncidentHealth({available: false, condition: "unknown", failure_likelihood: "unknown"});
+      return null;
+    } finally {
+      waIncidentHealthRequest = null;
+    }
+  })();
+  return waIncidentHealthRequest;
+}
+
+function renderWaIncidentHistory(data) {
+  const panel = document.getElementById("wa-incident-history");
+  const status = document.getElementById("wa-incident-history-status");
+  const list = document.getElementById("wa-incident-history-list");
+  panel.style.display = "block";
+  list.replaceChildren();
+  if (!data || !data.ok) {
+    status.textContent = data?.integrity === "invalid"
+      ? "La cadena forense es inválida; no se mostraron registros parciales."
+      : "No fue posible verificar el historial.";
+    return;
+  }
+  status.textContent = data.available
+    ? `Cadena verificada · ${data.total_records} registros totales`
+    : "Cadena verificada · todavía no hay incidentes registrados";
+  const records = Array.isArray(data.records) ? [...data.records].reverse() : [];
+  if (!records.length) {
+    const item = document.createElement("li");
+    item.textContent = "Sin eventos forenses para mostrar";
+    list.appendChild(item);
+    return;
+  }
+  for (const record of records) {
+    const item = document.createElement("li");
+    const at = Number.isFinite(record.at) ? new Date(record.at).toLocaleString() : "Hora desconocida";
+    const code = Number.isInteger(record.status_code) ? ` · código ${record.status_code}` : "";
+    item.textContent = `${at} · ${waIncidentStatusLabel(record.status_name)}${code}`;
+    list.appendChild(item);
+  }
+}
+
+async function loadWaIncidentHistory() {
+  const button = document.getElementById("wa-incident-history-btn");
+  button.disabled = true;
+  try {
+    const response = await fetch("/api/wa_incidents?limit=20", {cache: "no-store"});
+    const data = await response.json();
+    if (response.status === 403) {
+      const panel = document.getElementById("wa-incident-history");
+      panel.style.display = "block";
+      document.getElementById("wa-incident-history-status").textContent = "Recupera el acceso administrativo para consultar el historial.";
+      document.getElementById("wa-incident-history-list").replaceChildren();
+      return;
+    }
+    renderWaIncidentHistory(data);
+  } catch {
+    renderWaIncidentHistory({ok: false, integrity: "unavailable"});
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -2098,14 +2579,20 @@ document.getElementById("admin-operator-key").addEventListener("keydown", event 
 // Auto-refresh cada 10 segundos
 loadData();
 loadChannelState();
+loadWaIncidentHealth();
 loadWaSafetyHealth();
+loadBillingStatus();
 setInterval(loadData, 10000);
 setInterval(loadChannelState, 10000);
+setInterval(loadWaIncidentHealth, 10000);
 setInterval(loadWaSafetyHealth, 10000);
+setInterval(loadBillingStatus, 30000);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
     loadChannelState();
+    loadWaIncidentHealth();
     loadWaSafetyHealth();
+    loadBillingStatus();
   }
 });
 </script>
@@ -2131,6 +2618,124 @@ body { background: #17212b; color: #e0e0e0; font-family: system-ui; margin: 0; p
 <div class="audio-msg">🎵 {{ step.audio }}</div>
 {% endfor %}
 <div class="small" style="margin-top:16px;">* Así se ven los mensajes en Telegram</div>
+</body>
+</html>"""
+
+WA_RELINK_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reconectar WhatsApp</title>
+<style>
+body { margin:0; background:#10151c; color:#ecf2f8; font-family:system-ui,sans-serif; }
+main { max-width:520px; margin:8vh auto; padding:28px; background:#19222d; border-radius:16px; text-align:center; }
+h1 { font-size:1.45rem; } p { line-height:1.5; }
+img { width:320px; max-width:100%; padding:10px; background:#fff; border-radius:12px; }
+button { margin-top:18px; padding:10px 16px; border:0; border-radius:9px; cursor:pointer; }
+.muted { color:#aebdca; font-size:.9rem; }
+</style>
+</head>
+<body><main>
+<h1>Reconectar WhatsApp</h1>
+<p id="status">Validando este enlace privado…</p>
+<img id="qr" alt="QR de vinculación de WhatsApp" hidden>
+<p class="muted">Abre WhatsApp → Dispositivos vinculados y escanea el código. No compartas esta página.</p>
+<button id="generate" type="button">Generar QR</button>
+<button id="cancel" type="button" hidden>Cancelar</button>
+</main>
+<script nonce="{{ nonce }}">
+(() => {
+  const status = document.getElementById("status");
+  const image = document.getElementById("qr");
+  const generate = document.getElementById("generate");
+  const cancel = document.getElementById("cancel");
+  let csrf = null;
+  let stopped = false;
+  let qrRevision = null;
+
+  function headers() {
+    return {"Content-Type":"application/json", "X-WA-Relink-CSRF":csrf || ""};
+  }
+  async function json(response) {
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) throw new Error(data.error || "No fue posible continuar.");
+    return data;
+  }
+  async function commit() {
+    const data = await json(await fetch("/api/wa-relink/commit", {
+      method:"POST", headers:headers(), body:"{}", cache:"no-store"
+    }));
+    stopped = true;
+    image.hidden = true;
+    cancel.hidden = true;
+    status.textContent = data.message || "WhatsApp está nuevamente en línea.";
+  }
+  async function poll() {
+    if (stopped) return;
+    try {
+      const data = await json(await fetch("/api/wa-relink/status", {cache:"no-store"}));
+      if (data.ready_to_commit) return await commit();
+      if (data.qr_ready) {
+        status.textContent = "Escanea este QR. Confirmaremos la conexión automáticamente.";
+        cancel.hidden = false;
+        if (data.qr_revision !== qrRevision) {
+          qrRevision = data.qr_revision;
+          image.src = "/api/wa-relink/qr?rev=" + encodeURIComponent(qrRevision);
+        }
+        image.hidden = false;
+      } else {
+        status.textContent = "Preparando un QR seguro…";
+      }
+      setTimeout(poll, 1000);
+    } catch (error) {
+      stopped = true;
+      status.textContent = error.message;
+      image.hidden = true;
+    }
+  }
+  cancel.addEventListener("click", async () => {
+    if (stopped) return;
+    stopped = true;
+    try {
+      const data = await json(await fetch("/api/wa-relink/cancel", {
+        method:"POST", headers:headers(), body:"{}", cache:"no-store"
+      }));
+      status.textContent = data.message || "Vinculación cancelada.";
+    } catch (error) { status.textContent = error.message; }
+    image.hidden = true;
+    cancel.hidden = true;
+  });
+
+  const token = window.location.hash.slice(1);
+  history.replaceState(null, "", window.location.pathname + window.location.search);
+  if (token.length > 160) {
+    status.textContent = "Este enlace no es válido o ya venció.";
+    generate.disabled = true;
+    return;
+  }
+  status.textContent = "Pulsa Generar QR para iniciar la vinculación.";
+  generate.addEventListener("click", async () => {
+    generate.disabled = true;
+    status.textContent = "Preparando una vinculación segura…";
+    try {
+      const data = await json(await fetch("/api/wa-relink/confirm", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({token}),
+        cache:"no-store"
+      }));
+      csrf = data.csrf;
+      generate.hidden = true;
+      cancel.hidden = false;
+      poll();
+    } catch (error) {
+      generate.disabled = false;
+      status.textContent = error.message;
+    }
+  });
+})();
+</script>
 </body>
 </html>"""
 
@@ -2183,11 +2788,20 @@ def _operator_recovery_key_version(configured_key: str) -> str | None:
     ).hexdigest()
 
 
-def _channel_worker_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
-    """Build a worker environment that cannot inherit the panel operator key."""
+def _channel_worker_environment(
+    extra: dict[str, str] | None = None,
+    *,
+    keep_autoreply_token: bool = False,
+) -> dict[str, str]:
+    """Build a least-privilege worker environment from the panel process."""
 
     worker_env = os.environ.copy()
+    worker_env.pop("FLASK_SECRET", None)
     worker_env.pop(PANEL_ADMIN_RECOVERY_KEY_ENV, None)
+    worker_env.pop("BILLING_CONTROL_PLANE_ADMIN_TOKEN", None)
+    worker_env.pop("WA_RELINK_TELEGRAM_BOT_TOKEN", None)
+    if not keep_autoreply_token:
+        worker_env.pop("AUTOREPLY_BOT_TOKEN", None)
     if extra:
         worker_env.update(extra)
     return worker_env
@@ -2320,6 +2934,12 @@ _PANEL_CSRF_ONLY_MUTATIONS = frozenset({
     "/api/admin_access/operator",
 })
 
+_WA_RELINK_SCOPED_MUTATIONS = frozenset({
+    "/api/wa-relink/confirm",
+    "/api/wa-relink/commit",
+    "/api/wa-relink/cancel",
+})
+
 
 @app.before_request
 def _protect_panel_api_mutations():
@@ -2333,6 +2953,10 @@ def _protect_panel_api_mutations():
     # toca la sesión. Se conserva sin auth para que clientes antiguos fallen de
     # forma explícita en lugar de interpretar un 403 como un problema de acceso.
     if request.path == "/api/reset_wa":
+        return None
+    if request.path in _WA_RELINK_SCOPED_MUTATIONS:
+        # These handlers enforce a one-purpose recovery capability and their
+        # own CSRF token. They never grant panel administration.
         return None
     if request.path in _PANEL_CSRF_ONLY_MUTATIONS:
         return _channel_csrf_error()
@@ -2994,6 +3618,73 @@ def api_wa_call_health():
     response.headers["Cache-Control"] = "no-store, private"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+def _wa_incident_json_response(payload: dict, status: int = 200):
+    response = jsonify(payload)
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response, status
+
+
+@app.route("/api/wa_incident_health")
+def api_wa_incident_health():
+    health = public_wa_incident_health(
+        WA_INCIDENT_HEALTH_FILE,
+        can_manage=_can_manage_channels(),
+        worker_running=_wa_worker_running(),
+    )
+    return _wa_incident_json_response(health)
+
+
+@app.route("/api/wa_incidents")
+def api_wa_incidents():
+    if not _can_manage_channels():
+        return _wa_incident_json_response({
+            "ok": False,
+            "error_code": "admin_required",
+            "error": "Sesión administrativa requerida.",
+        }, 403)
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except (TypeError, ValueError, OverflowError):
+        limit = 20
+    limit = min(max(limit, 1), 100)
+    history = read_wa_incident_history(
+        WA_INCIDENT_LEDGER_FILE,
+        can_manage=True,
+        limit=limit,
+        snapshot_path=WA_INCIDENT_HEALTH_FILE,
+    )
+    return _wa_incident_json_response(history)
+
+
+@app.route("/wa-relink")
+def wa_relink_preview():
+    """Static preview: the URL fragment is redeemed only by the scoped POST."""
+
+    try:
+        config = _wa_relink_config()
+    except RelinkConfigurationError:
+        return "Recovery unavailable", 503
+    if not config.enabled:
+        return "Not found", 404
+    nonce = secrets.token_urlsafe(18)
+    response = make_response(render_template_string(WA_RELINK_TEMPLATE, nonce=nonce))
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = (
+        f"default-src 'none'; img-src 'self'; script-src 'nonce-{nonce}'; "
+        "style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; "
+        "frame-ancestors 'none'; form-action 'self'"
+    )
     return response
 
 
@@ -3948,6 +4639,10 @@ def _wa_process_running(pid_file: Path) -> bool:
     return bool(pid and _is_wa_worker_pid(pid))
 
 
+def _wa_worker_running() -> bool:
+    return _wa_process_running(DATA_DIR / "wa_bot.pid")
+
+
 def _stop_wa_process(pid_file: Path) -> None:
     pid = _tracked_wa_pid(pid_file)
     if pid and _is_wa_worker_pid(pid):
@@ -4288,6 +4983,140 @@ def api_test_mode_reset():
     return api_response
 
 
+def _wa_relink_config() -> WhatsAppRelinkConfig:
+    return WhatsAppRelinkConfig.from_environment(os.environ)
+
+
+def _wa_relink_error(code: str, status: int):
+    messages = {
+        "disabled": "La recuperación automática no está habilitada.",
+        "configuration_invalid": "La recuperación automática no está disponible.",
+        "state_corrupt": "El estado de recuperación requiere revisión del operador.",
+        "token_invalid": "Este enlace no es válido o ya venció.",
+        "token_expired": "Este enlace venció.",
+        "token_consumed": "Este enlace ya fue utilizado.",
+        "capability_invalid": "Esta sesión de recuperación no es válida.",
+        "capability_expired": "Esta sesión de recuperación venció.",
+        "csrf_invalid": "La sesión de recuperación cambió. Abre nuevamente el enlace.",
+        "switch_in_progress": "Ya hay una vinculación de WhatsApp en curso.",
+        "recovery_required": "Existe un respaldo pendiente de recuperación manual.",
+        "candidate_failed": "No fue posible preparar el QR.",
+        "candidate_not_ready": "WhatsApp aún no terminó de vincularse.",
+        "identity_unverified": "No fue posible verificar la identidad completa de ambas cuentas.",
+        "identity_mismatch": "La cuenta escaneada no coincide con la cuenta anterior.",
+    }
+    return jsonify({"ok": False, "error_code": code, "error": messages.get(code, "No fue posible continuar.")}), status
+
+
+def _wa_relink_capability_state():
+    capability = session.get("wa_relink_capability")
+    if not isinstance(capability, dict):
+        raise RelinkTokenError("capability_invalid")
+    incident_id = capability.get("incident_id")
+    secret_value = capability.get("secret")
+    if not isinstance(incident_id, str) or not isinstance(secret_value, str):
+        raise RelinkTokenError("capability_invalid")
+    return _wa_relink_store.capability_state(
+        incident_id,
+        relink_capability_digest(secret_value),
+    )
+
+
+def _wa_relink_capability_error(*, require_csrf: bool):
+    try:
+        state = _wa_relink_capability_state()
+    except RelinkStateCorrupt:
+        return None, _wa_relink_error("state_corrupt", 503)
+    except RelinkTokenError as exc:
+        code = exc.code if exc.code in {"capability_expired", "capability_invalid"} else "capability_invalid"
+        return None, _wa_relink_error(code, 403)
+    except RelinkStateError:
+        return None, _wa_relink_error("state_corrupt", 503)
+    if require_csrf:
+        supplied = request.headers.get("X-WA-Relink-CSRF", "")
+        expected = session.get("wa_relink_csrf")
+        if not isinstance(expected, str) or not supplied or not secrets.compare_digest(supplied, expected):
+            return None, _wa_relink_error("csrf_invalid", 403)
+    return state, None
+
+
+def _wa_relink_switch_owned(operation: dict | None) -> bool:
+    capability = session.get("wa_relink_capability")
+    if not isinstance(operation, dict) or not isinstance(capability, dict):
+        return False
+    secret_value = capability.get("secret")
+    incident_id = capability.get("incident_id")
+    expected = operation.get("token_hash")
+    return bool(
+        operation.get("source") == "relink"
+        and isinstance(secret_value, str)
+        and isinstance(incident_id, str)
+        and operation.get("incident_id") == incident_id
+        and isinstance(expected, str)
+        and secrets.compare_digest(relink_capability_digest(secret_value), expected)
+    )
+
+
+def _wa_auth_account_id(auth_dir: Path) -> str | None:
+    """Read a full Baileys account id in memory without exposing it."""
+
+    try:
+        raw = json.loads((auth_dir / "creds.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    me = raw.get("me") if isinstance(raw, dict) else None
+    jid = me.get("id") if isinstance(me, dict) else None
+    if not isinstance(jid, str):
+        return None
+    match = re.fullmatch(r"([0-9]{5,20})(?::[0-9]+)?@(?:s\.whatsapp\.net|lid)", jid)
+    return match.group(1) if match else None
+
+
+def _start_scoped_wa_relink(state: dict) -> tuple[dict | None, tuple | None]:
+    """Start or reuse exactly one link-only candidate for this incident."""
+
+    with _wa_relink_lock, _wa_switch_lock:
+        _reap_expired_wa_switch()
+        operation = _load_wa_switch_operation()
+        if _whatsapp_recovery_pending() or (
+            operation and operation.get("status") == "recovery_required"
+        ):
+            return None, _wa_relink_error("recovery_required", 409)
+        if operation:
+            if _wa_relink_switch_owned(operation) and _wa_process_running(WA_SWITCH_PID_FILE):
+                return operation, None
+            return None, _wa_relink_error("switch_in_progress", 409)
+
+        _cleanup_wa_switch_candidate()
+        _secure_directory(WA_SWITCH_AUTH_DIR)
+        capability = session["wa_relink_capability"]
+        operation = {
+            "version": 2,
+            "source": "relink",
+            "incident_id": state["incident_id"],
+            "operation_id": secrets.token_hex(12),
+            "token_hash": relink_capability_digest(capability["secret"]),
+            "started_at": time.time(),
+            "status": "preparing",
+        }
+        _save_wa_switch_operation(operation)
+        _schedule_wa_switch_expiry(operation)
+        pid = _start_wa_process(
+            auth_dir=WA_SWITCH_AUTH_DIR,
+            qr_file=WA_SWITCH_QR_FILE,
+            health_file=WA_SWITCH_HEALTH_FILE,
+            identity_file=WA_SWITCH_IDENTITY_FILE,
+            pid_file=WA_SWITCH_PID_FILE,
+            link_only=True,
+            log_name="bot_wa_switch.log",
+        )
+        if not pid:
+            _cleanup_wa_switch_candidate()
+            return None, _wa_relink_error("candidate_failed", 503)
+        _wa_relink_store.mark_qr_started(state["incident_id"])
+        return operation, None
+
+
 def _wa_switch_token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -4396,12 +5225,17 @@ def _reap_expired_wa_switch() -> None:
         _cleanup_wa_switch_files()
 
 
-def _promote_wa_candidate() -> tuple[bool, str, dict, bool, bool]:
+def _promote_wa_candidate(
+    *,
+    ownership_check=None,
+    grant_channel_admin: bool = True,
+) -> tuple[bool, str, dict, bool, bool]:
     """Promueve la cuenta escaneada y restaura la anterior si no queda online."""
 
     with _wa_switch_lock, _wa_process_lock:
         operation = _load_wa_switch_operation()
-        if not _wa_switch_owned(operation):
+        owns_operation = ownership_check(operation) if ownership_check else _wa_switch_owned(operation)
+        if not owns_operation:
             return False, "El intento de cambio ya no pertenece a este navegador.", {}, True, _wa_connection_open()
         if operation.get("status") == "recovery_required" or _whatsapp_recovery_pending():
             return False, "Hay un respaldo pendiente de recuperación manual.", {}, True, _wa_connection_open()
@@ -4510,8 +5344,9 @@ def _promote_wa_candidate() -> tuple[bool, str, dict, bool, bool]:
         rollback_state.unlink(missing_ok=True)
         rollback_identity.unlink(missing_ok=True)
         _cleanup_wa_switch_candidate()
-        session["channel_admin"] = True
-        session.permanent = True
+        if grant_channel_admin:
+            session["channel_admin"] = True
+            session.permanent = True
         return True, "Cuenta de WhatsApp cambiada y verificada.", candidate_identity, True, True
 
 @app.route("/api/restart_bot", methods=["POST"])
@@ -4682,6 +5517,10 @@ def api_switch_wa_claim():
 
         token = secrets.token_urlsafe(32)
         operation["token_hash"] = _wa_switch_token_digest(token)
+        if operation.get("source") == "relink":
+            operation["source"] = "admin"
+            operation.pop("incident_id", None)
+            operation.pop("operation_id", None)
         _save_wa_switch_operation(operation)
         _schedule_wa_switch_expiry(operation)
         session["wa_switch_token"] = token
@@ -4811,6 +5650,192 @@ def api_switch_wa_cancel():
     return jsonify({"ok": True, "message": "Cambio cancelado; la cuenta anterior sigue activa."})
 
 
+@app.after_request
+def _protect_wa_relink_responses(response):
+    if request.path == "/wa-relink" or request.path.startswith("/api/wa-relink/"):
+        response.headers["Cache-Control"] = "no-store, private"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+    return response
+
+
+@app.route("/api/wa-relink/confirm", methods=["POST"])
+def api_wa_relink_confirm():
+    """Consume the fragment token once and start/reuse one scoped candidate."""
+
+    try:
+        config = _wa_relink_config()
+    except RelinkConfigurationError:
+        return _wa_relink_error("configuration_invalid", 503)
+    if not config.enabled:
+        return _wa_relink_error("disabled", 404)
+
+    # A browser that already consumed the link may safely retry candidate
+    # startup without consuming or rotating anything again.
+    try:
+        state = _wa_relink_capability_state()
+    except RelinkTokenError:
+        state = None
+    except RelinkStateCorrupt:
+        return _wa_relink_error("state_corrupt", 503)
+    except RelinkStateError:
+        return _wa_relink_error("state_corrupt", 503)
+    if state is not None:
+        csrf = session.get("wa_relink_csrf")
+        if not isinstance(csrf, str):
+            csrf = secrets.token_urlsafe(32)
+            session["wa_relink_csrf"] = csrf
+        operation, error = _start_scoped_wa_relink(state)
+        if error:
+            return error
+        return jsonify({
+            "ok": True,
+            "state": "preparing",
+            "csrf": csrf,
+            "operation_id": operation.get("operation_id"),
+        }), 202
+
+    data = request.get_json(silent=True)
+    token = data.get("token") if isinstance(data, dict) else None
+    if not isinstance(token, str):
+        return _wa_relink_error("token_invalid", 403)
+
+    with _wa_relink_lock, _wa_switch_lock:
+        _reap_expired_wa_switch()
+        operation = _load_wa_switch_operation()
+        if _whatsapp_recovery_pending() or (
+            operation and operation.get("status") == "recovery_required"
+        ):
+            return _wa_relink_error("recovery_required", 409)
+        if operation:
+            return _wa_relink_error("switch_in_progress", 409)
+        capability_secret = secrets.token_urlsafe(32)
+        try:
+            state = _wa_relink_store.consume_token(
+                token,
+                relink_capability_digest(capability_secret),
+            )
+        except RelinkStateCorrupt:
+            return _wa_relink_error("state_corrupt", 503)
+        except RelinkTokenError as exc:
+            code = exc.code if exc.code in {"token_expired", "token_consumed"} else "token_invalid"
+            return _wa_relink_error(code, 410 if code != "token_invalid" else 403)
+        except RelinkStateError:
+            return _wa_relink_error("state_corrupt", 503)
+        csrf = secrets.token_urlsafe(32)
+        session["wa_relink_capability"] = {
+            "incident_id": state["incident_id"],
+            "secret": capability_secret,
+        }
+        session["wa_relink_csrf"] = csrf
+        operation, error = _start_scoped_wa_relink(state)
+    if error:
+        return error
+    return jsonify({
+        "ok": True,
+        "state": "preparing",
+        "csrf": csrf,
+        "operation_id": operation.get("operation_id"),
+    }), 202
+
+
+@app.route("/api/wa-relink/status")
+def api_wa_relink_status():
+    state, error = _wa_relink_capability_error(require_csrf=False)
+    if error:
+        return error
+    with _wa_switch_lock:
+        operation = _load_wa_switch_operation()
+        if not _wa_relink_switch_owned(operation):
+            return _wa_relink_error("candidate_failed", 410)
+        if time.time() - float(operation.get("started_at", 0)) >= WA_SWITCH_TIMEOUT_SECONDS:
+            _cleanup_wa_switch_candidate()
+            return _wa_relink_error("candidate_failed", 410)
+        if _wa_connection_open(WA_SWITCH_PID_FILE, WA_SWITCH_HEALTH_FILE):
+            return jsonify({"ok": True, "state": "scanned", "ready_to_commit": True})
+        if not _wa_process_running(WA_SWITCH_PID_FILE):
+            _cleanup_wa_switch_candidate()
+            return _wa_relink_error("candidate_failed", 503)
+        revision = _wa_qr_revision()
+        return jsonify({
+            "ok": True,
+            "state": "awaiting_qr" if revision else "preparing",
+            "qr_ready": revision is not None,
+            "qr_revision": revision,
+            "ready_to_commit": False,
+            "incident_id": state["incident_id"],
+        })
+
+
+@app.route("/api/wa-relink/qr")
+def api_wa_relink_qr():
+    _state, error = _wa_relink_capability_error(require_csrf=False)
+    if error:
+        return error
+    operation = _load_wa_switch_operation()
+    if not _wa_relink_switch_owned(operation) or not WA_SWITCH_QR_FILE.is_file():
+        return _wa_relink_error("candidate_failed", 404)
+    response = send_from_directory(str(WA_SWITCH_DIR), WA_SWITCH_QR_FILE.name)
+    response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
+    return response
+
+
+@app.route("/api/wa-relink/commit", methods=["POST"])
+def api_wa_relink_commit():
+    state, error = _wa_relink_capability_error(require_csrf=True)
+    if error:
+        return error
+    with _wa_switch_lock:
+        operation = _load_wa_switch_operation()
+        if not _wa_relink_switch_owned(operation):
+            return _wa_relink_error("candidate_failed", 404)
+        if not _wa_connection_open(WA_SWITCH_PID_FILE, WA_SWITCH_HEALTH_FILE):
+            return _wa_relink_error("candidate_not_ready", 409)
+        previous_account = _wa_auth_account_id(WA_AUTH_DIR)
+        candidate_account = _wa_auth_account_id(WA_SWITCH_AUTH_DIR)
+        if previous_account is None or candidate_account is None:
+            return _wa_relink_error("identity_unverified", 409)
+        if not secrets.compare_digest(previous_account, candidate_account):
+            return _wa_relink_error("identity_mismatch", 409)
+        switched, message, identity, previous_preserved, previous_ready = _promote_wa_candidate(
+            ownership_check=_wa_relink_switch_owned,
+            grant_channel_admin=False,
+        )
+    if switched:
+        _wa_relink_store.mark_promoted(state["incident_id"])
+        _supervise_wa_relink_once()
+        session.pop("wa_relink_capability", None)
+        session.pop("wa_relink_csrf", None)
+        return jsonify({"ok": True, "state": "ready", "message": message, "identity": identity})
+    return jsonify({
+        "ok": False,
+        "state": "rollback_restored" if previous_preserved else "recovery_required",
+        "error": message,
+        "previous_account_preserved": previous_preserved,
+        "previous_worker_ready": previous_ready,
+    }), 503
+
+
+@app.route("/api/wa-relink/cancel", methods=["POST"])
+def api_wa_relink_cancel():
+    state, error = _wa_relink_capability_error(require_csrf=True)
+    if error:
+        return error
+    with _wa_switch_lock:
+        operation = _load_wa_switch_operation()
+        if not _wa_relink_switch_owned(operation):
+            return _wa_relink_error("candidate_failed", 404)
+        if operation.get("status") == "recovery_required":
+            return _wa_relink_error("recovery_required", 409)
+        _cleanup_wa_switch_candidate()
+        _wa_relink_store.cancel(state["incident_id"])
+    session.pop("wa_relink_capability", None)
+    session.pop("wa_relink_csrf", None)
+    return jsonify({"ok": True, "message": "Vinculación cancelada; no se modificó la cuenta anterior."})
+
+
 @app.route("/api/channels")
 def api_channels():
     """Resumen seguro para la UX de vinculación y cambio de cuentas."""
@@ -4880,6 +5905,123 @@ def api_channels():
     return response
 
 
+@app.route("/api/billing/status")
+def api_billing_status():
+    """Expose billing state only to an authorized panel session."""
+
+    if not _can_manage_channels():
+        return jsonify({"ok": False, "error_code": "admin_required"}), 403
+    local = billing_gate.decision()
+    central = billing_gate.billing_status()
+    response_data = {
+        "ok": True,
+        "local": local,
+        "billing": central.get("billing") if central.get("ok") else {
+            "status": local.get("status"),
+            "service_allowed": local.get("observed_allowed"),
+            "paid_through": local.get("paid_through"),
+            "grace_until": local.get("grace_until"),
+            "override_until": local.get("override_until"),
+        },
+        "commercial": central.get("commercial", {
+            "amount": 25000,
+            "currency": "eur",
+            "tax_automation": False,
+            "billing_interval": "month",
+        }),
+        "provider": central.get("provider", {}),
+        "provider_gates": central.get("provider_gates", []),
+        "payment_methods": central.get("payment_methods", []),
+        "payment_orders": central.get("payment_orders", []),
+        "audit": central.get("audit", []),
+        "control_plane_available": central.get("ok") is True,
+    }
+    response = jsonify(response_data)
+    response.headers["Cache-Control"] = "no-store, private"
+    return response
+
+
+def _billing_panel_action(action: str):
+    security_error = _channel_mutation_error()
+    if security_error:
+        return security_error
+    try:
+        if action == "checkout":
+            data = request.get_json(silent=True) or {}
+            method_id = str(data.get("method_id") or "").strip()
+            if not re.fullmatch(r"[a-z0-9-]{3,64}", method_id):
+                return jsonify({"ok": False, "error_code": "invalid_payment_method"}), 400
+            raw_payer = data.get("payer") or {}
+            if not isinstance(raw_payer, dict) or set(raw_payer) - {"name", "email", "document", "phone"}:
+                return jsonify({"ok": False, "error_code": "invalid_payer"}), 400
+            payer = {}
+            for key, value in raw_payer.items():
+                if not isinstance(value, str) or len(value) > 200:
+                    return jsonify({"ok": False, "error_code": "invalid_payer"}), 400
+                payer[key] = value
+            result = billing_gate.create_checkout(method_id=method_id, payer=payer)
+        elif action == "portal":
+            result = billing_gate.create_portal()
+        else:
+            return jsonify({"ok": False, "error_code": "unsupported_action"}), 400
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "error_code": "billing_action_failed",
+            "error_type": type(exc).__name__,
+        }), 503
+    target = str(result.get("url") or "")
+    action_name = str(result.get("action") or "redirect")
+    if target and not target.startswith("https://"):
+        return jsonify({"ok": False, "error_code": "invalid_provider_url"}), 502
+    if not target and action_name != "await_provider_confirmation":
+        return jsonify({"ok": False, "error_code": "invalid_provider_action"}), 502
+    return jsonify({
+        "ok": True,
+        "url": target or None,
+        "action": action_name,
+        "method_id": result.get("method_id"),
+        "order_id": result.get("order_id"),
+    })
+
+
+@app.route("/api/billing/checkout", methods=["POST"])
+def api_billing_checkout():
+    return _billing_panel_action("checkout")
+
+
+@app.route("/api/billing/portal", methods=["POST"])
+def api_billing_portal():
+    return _billing_panel_action("portal")
+
+
+@app.route("/api/billing/override", methods=["POST"])
+def api_billing_override():
+    security_error = _channel_mutation_error()
+    if security_error:
+        return security_error
+    data = request.get_json(silent=True) or {}
+    reason = str(data.get("reason") or "")
+    try:
+        duration_seconds = int(data.get("duration_seconds", 0))
+    except (TypeError, ValueError):
+        duration_seconds = 0
+    if not 1 <= duration_seconds <= 24 * 60 * 60:
+        return jsonify({"ok": False, "error_code": "invalid_override_duration"}), 400
+    try:
+        result = billing_gate.create_override(
+            reason=reason,
+            duration_seconds=duration_seconds,
+        )
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "error_code": "billing_override_failed",
+            "error_type": type(exc).__name__,
+        }), 503
+    return jsonify({"ok": True, "override": result.get("override", result)})
+
+
 @app.route("/api/start_botfather", methods=["POST"])
 def api_start_botfather():
     """Arranca el proceso botfather_bot.py si no está corriendo."""
@@ -4907,7 +6049,7 @@ def api_start_botfather():
             proc = subprocess.Popen(
                 [sys.executable, bot_script],
                 stdout=f, stderr=subprocess.STDOUT,
-                env=_channel_worker_environment(),
+                env=_channel_worker_environment(keep_autoreply_token=True),
                 start_new_session=True
             )
             # Guardar PID
@@ -4921,9 +6063,84 @@ def api_start_botfather():
 _supervisor_thread_started = False
 _supervisor_lock = threading.Lock()
 
+
+def _supervise_wa_relink_once() -> None:
+    """Create/notify one incident, or resolve it after the main socket is open."""
+
+    global _wa_relink_config_warning_emitted
+    try:
+        config = _wa_relink_config()
+    except RelinkConfigurationError:
+        if not _wa_relink_config_warning_emitted:
+            print("[WA RELINK] Configuración inválida; recuperación automática bloqueada.")
+            _wa_relink_config_warning_emitted = True
+        return
+    if not config.enabled:
+        return
+
+    try:
+        if _wa_connection_open():
+            state, _changed = _wa_relink_store.resolve()
+            if state is None:
+                return
+            state, claim_id = _wa_relink_store.claim_notification("online")
+            if state is None or claim_id is None:
+                return
+            delivered = False
+            try:
+                TelegramRelinkNotifier(config).send_online()
+                delivered = True
+            except RelinkNotificationError:
+                pass
+            _wa_relink_store.finish_notification(
+                state["incident_id"],
+                "online",
+                claim_id,
+                delivered,
+            )
+            return
+
+        health = _read_wa_call_health(WA_CALL_HEALTH_FILE)
+        auth_present = WA_AUTH_DIR.exists() and any(WA_AUTH_DIR.iterdir())
+        reason = health.get("disconnect_reason")
+        reauth_required = bool(
+            auth_present
+            and health.get("reauth_required") is True
+            and reason in {"logged_out", "session_invalid"}
+        )
+        if not reauth_required:
+            return
+        fingerprint = relink_outage_fingerprint(health.get("worker_revision"), reason)
+        state, _created = _wa_relink_store.ensure_outage(fingerprint, reason)
+        state, claim_id = _wa_relink_store.claim_notification("alert")
+        if state is None or claim_id is None:
+            return
+        token = _wa_relink_store.token_for(state)
+        delivered = False
+        try:
+            notifier = TelegramRelinkNotifier(config)
+            notifier.send_relink_alert(config.recovery_url(token))
+            delivered = True
+        except RelinkNotificationError:
+            pass
+        _wa_relink_store.finish_notification(
+            state["incident_id"],
+            "alert",
+            claim_id,
+            delivered,
+        )
+    except RelinkStateCorrupt:
+        if not _wa_relink_config_warning_emitted:
+            print("[WA RELINK] Estado inválido; recuperación automática bloqueada.")
+            _wa_relink_config_warning_emitted = True
+    except RelinkStateError:
+        pass
+
+
 def _supervise_background_services_once() -> None:
     """Run one coordinated supervisor pass without racing account/test changes."""
 
+    _supervise_wa_relink_once()
     with _wa_switch_lock:
         wa_auth_present = WA_AUTH_DIR.exists() and any(WA_AUTH_DIR.iterdir())
         wa_switching = bool(_load_wa_switch_operation())

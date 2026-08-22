@@ -533,3 +533,26 @@ test('operational pause rejects the call without consuming interaction state', a
   assert.equal(routes, 1);
   assert.deepEqual(effects, ['reject', 'reject', 'send']);
 });
+
+test('commercial suspension neither rejects nor records the call', async () => {
+  let routes = 0;
+  const effects = [];
+  const handler = createWhatsAppCallHandler({
+    rejectCall: async () => effects.push('reject'),
+    sendMessage: async () => effects.push('send'),
+    interactionAllowed: () => false,
+    getResponseMessage: () => ({ text: 'call', audio: '' }),
+    routeInteraction: async () => {
+      routes += 1;
+      return { language: 'es', responseKey: 'call', contactKey: 'contact' };
+    },
+    readAudio: async () => null,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  const blocked = await handler([offer({ id: 'billing-blocked-call' })]);
+
+  assert.equal(blocked[0].reason, 'interaction_blocked');
+  assert.equal(routes, 0);
+  assert.deepEqual(effects, []);
+});

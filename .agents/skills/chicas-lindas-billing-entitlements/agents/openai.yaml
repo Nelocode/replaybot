@@ -1,0 +1,4 @@
+interface:
+  display_name: "Chicas Lindas Billing Entitlements"
+  short_description: "Review the six-bot monthly access contract"
+  default_prompt: "Use $chicas-lindas-billing-entitlements to implement or review the monthly billing entitlement flow."

@@ -148,7 +148,7 @@ class OperatorAdminRecoveryGuardTestCase(unittest.TestCase):
         self.assertNotIn("PanelAdminAccessStore", app_source)
         self.assertNotIn(".create_challenge(", app_source)
         self.assertGreaterEqual(app_source.count("_channel_worker_environment("), 4)
-        self.assertIn("env=_channel_worker_environment()", app_source)
+        self.assertIn("env=_channel_worker_environment(", app_source)
         self.assertNotIn("source /app/data/.env.local", entrypoint_source)
         self.assertIn("TG_API_ID|TG_API_HASH|TG_PHONE|AUTOREPLY_BOT_TOKEN", entrypoint_source)
         self.assertNotIn(
@@ -175,7 +175,7 @@ class OperatorAdminRecoveryGuardTestCase(unittest.TestCase):
 
         project_root = Path(__file__).resolve().parents[1]
         entrypoint_source = (project_root / "entrypoint.sh").read_text(encoding="utf-8")
-        self.assertEqual(3, entrypoint_source.count("env -u PANEL_ADMIN_RECOVERY_KEY"))
+        self.assertEqual(3, entrypoint_source.count("-u PANEL_ADMIN_RECOVERY_KEY"))
 
 
 class OperatorAdminRecoveryRouteTestCase(unittest.TestCase):

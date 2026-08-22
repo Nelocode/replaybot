@@ -1,0 +1,4 @@
+interface:
+  display_name: "Chicas Lindas Dual Repo Release"
+  short_description: "Coordinate Madrid, Barcelona, and billing releases"
+  default_prompt: "Use $chicas-lindas-dual-repo-release to prepare and verify a coordinated bot release."
