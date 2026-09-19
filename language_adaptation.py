@@ -77,7 +77,7 @@ def _normalised_observation(
         return language, bool(language and strong), True
     language = detected_language if detected_language in VALID_LANGUAGES else None
     # Legacy language-only observations remain compatible but deliberately
-    # weak, so an old call site cannot bypass the two-observation policy.
+    # weak, so an old call site cannot immediately replace a confirmed language.
     return language, False, bool(language)
 
 
@@ -90,9 +90,10 @@ def reduce_language_state(
 ) -> dict[str, Any]:
     """Reduce one non-duplicate observation without retaining content.
 
-    Strong evidence changes immediately. A different weak language must occur
-    twice consecutively, even when the current language is provisional. With
-    no current language, the first weak observation may be used provisionally.
+    Strong evidence changes immediately. Weak evidence can replace a provisional
+    language immediately, while remaining provisional until confirmed. Replacing
+    a confirmed language requires two consecutive weak observations. With no
+    current language, the first weak observation may be used provisionally.
     Non-text observations leave a candidate untouched; ambiguous text clears
     it. An operator seed never blocks a later strong observation.
     """
@@ -151,6 +152,14 @@ def reduce_language_state(
         return next_state
     if strong:
         set_detected(detected)
+        return next_state
+    if next_state["language_provisional"] and detected != current:
+        # A phone/default hint or one weak observation must not outweigh the
+        # client's next identifiable text. One weak signal is still provisional.
+        next_state["language"] = detected
+        next_state["language_source"] = "provisional"
+        # Preserve a concordant candidate saved under the previous policy.
+        record_candidate(detected)
         return next_state
     if detected == current:
         if next_state["language_provisional"]:

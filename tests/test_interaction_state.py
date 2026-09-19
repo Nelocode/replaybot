@@ -293,7 +293,7 @@ class PersistentInteractionStateTests(unittest.TestCase):
             self.assertEqual("en", contact["language_candidate"])
             self.assertEqual(1, contact["language_candidate_streak"])
 
-    def test_provisional_language_needs_two_weak_observations(self):
+    def test_provisional_language_changes_on_first_weak_and_confirms_on_second(self):
         with tempfile.TemporaryDirectory() as directory:
             store = self.make_store(directory)
             store.register(
@@ -311,11 +311,19 @@ class PersistentInteractionStateTests(unittest.TestCase):
                 provisional_language="fr",
             )
             contact = next(iter(store._contacts.values()))
-            self.assertEqual("fr", first.language)
+            self.assertEqual("en", first.language)
             self.assertTrue(contact["language_provisional"])
+            self.assertEqual("provisional", contact["language_source"])
             self.assertEqual("en", contact["language_candidate"])
             self.assertEqual(1, contact["language_candidate_streak"])
 
+            store = self.make_store(directory)
+            reloaded = next(iter(store._contacts.values()))
+            self.assertEqual("en", reloaded["language"])
+            self.assertTrue(reloaded["language_provisional"])
+            self.assertEqual("provisional", reloaded["language_source"])
+            self.assertEqual("en", reloaded["language_candidate"])
+            self.assertEqual(1, reloaded["language_candidate_streak"])
             second = store.register(
                 contact_id=1,
                 event_id="message:weak-2",

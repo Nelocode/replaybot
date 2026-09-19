@@ -58,12 +58,12 @@ class BotFatherLanguageStateTests(unittest.TestCase):
         self.assertEqual("es", apply_language_evidence(state, detected_language="en"))
         self.assertFalse(state["language_provisional"])
 
-    def test_weak_evidence_requires_two_observations_even_when_provisional(self):
+    def test_weak_evidence_replaces_provisional_before_second_observation_confirms(self):
         state = {}
         self.assertEqual("es", apply_language_evidence(state, detected_language=None))
         weak = detect_language_evidence("want")
         self.assertEqual(
-            "es",
+            "en",
             apply_language_evidence(
                 state,
                 detected_language="en",
@@ -72,6 +72,8 @@ class BotFatherLanguageStateTests(unittest.TestCase):
         )
         self.assertEqual("en", state["language_candidate"])
         self.assertTrue(state["language_provisional"])
+        self.assertEqual("provisional", state["language_source"])
+        self.assertEqual(1, state["language_candidate_streak"])
         self.assertEqual(
             "en",
             apply_language_evidence(

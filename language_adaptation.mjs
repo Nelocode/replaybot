@@ -119,6 +119,15 @@ export function reduceLanguageState(state, {
     setDetected(observation.language);
     return nextState;
   }
+  if (nextState.language_provisional && observation.language !== current) {
+    // A phone/default hint or one weak observation must not outweigh the
+    // client's next identifiable text. One weak signal is still provisional.
+    nextState.language = observation.language;
+    nextState.language_source = 'provisional';
+    // Preserve a concordant candidate saved under the previous policy.
+    recordCandidate(observation.language);
+    return nextState;
+  }
   if (observation.language === current) {
     if (nextState.language_provisional) recordCandidate(observation.language);
     else clearCandidate();

@@ -368,7 +368,7 @@ test('al converger dos idiomas detected del mismo rango gana el estado más reci
   assert.equal(Object.keys(store.contacts).length, 1);
 });
 
-test('idioma provisional requiere dos observaciones débiles concordantes', () => {
+test('idioma provisional cambia al primer débil y se confirma con el segundo', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'interaction-state-'));
   const store = createStore(directory);
   store.register({
@@ -386,19 +386,27 @@ test('idioma provisional requiere dos observaciones débiles concordantes', () =
     provisionalLanguage: 'fr',
   });
   let contact = Object.values(store.contacts)[0];
-  assert.equal(first.language, 'fr');
+  assert.equal(first.language, 'en');
   assert.equal(contact.language_provisional, true);
+  assert.equal(contact.language_source, 'provisional');
   assert.equal(contact.language_candidate, 'en');
   assert.equal(contact.language_candidate_streak, 1);
 
-  const second = store.register({
+  const reloaded = createStore(directory);
+  const saved = Object.values(reloaded.contacts)[0];
+  assert.equal(saved.language, 'en');
+  assert.equal(saved.language_provisional, true);
+  assert.equal(saved.language_source, 'provisional');
+  assert.equal(saved.language_candidate, 'en');
+  assert.equal(saved.language_candidate_streak, 1);
+  const second = reloaded.register({
     contactId: 'a',
     eventId: 'message:weak-2',
     kind: 'content',
     languageEvidence: weak,
     provisionalLanguage: 'fr',
   });
-  contact = Object.values(store.contacts)[0];
+  contact = Object.values(reloaded.contacts)[0];
   assert.equal(second.language, 'en');
   assert.equal(contact.language_provisional, false);
   assert.equal(contact.language_candidate, null);
